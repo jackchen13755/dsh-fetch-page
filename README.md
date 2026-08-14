@@ -19,7 +19,7 @@ DSH fetch_page 工具 ──POST /forward──▶ 守护进程 127.0.0.1:9317 �
 ```
 
 - 守护进程独立于 DSH 常驻运行（launchd 保活），DSH 重启后转发链路不丢。
-- 扩展后台持续长轮询守护进程；扩展 popup 通过 `fetch` 调守护进程的控制端点。
+- 扩展后台持续长轮询守护进程，并通过 `fetch` 调守护进程的控制端点。
 
 ## 安装
 
@@ -105,10 +105,10 @@ pnpm install
 
 点击浏览器工具栏的「DSH 控制」图标：
 
-- **未启动**：自动启动 DSH 服务并打开 `http://127.0.0.1:3080`。
-- **已启动**：展开「重启 / 停止」按钮。
+- **左键**：DSH 未启动则自动启动，然后定位/打开 `http://127.0.0.1:3080`（已有该页面标签则直接激活聚焦，不重复开新标签）。
+- **右键**：菜单提供「重启 DSH / 停止 DSH」。
 
-控制请求由 popup 直接 `fetch` 守护进程的 `/status`、`/start`、`/stop`、`/restart` 端点完成。
+控制请求由后台 service worker 直接 `fetch` 守护进程的 `/status`、`/start`、`/stop`、`/restart` 端点完成。
 
 ### 抓取登录态页面
 
@@ -130,5 +130,5 @@ fetch_page url=https://example.com/private/page
 
 - 扩展后台通过 `chrome.alarms` 兜底恢复轮询；守护进程长轮询 25s，转发请求超时 30s。
 - 扩展必须登录目标站点，转发才会带上对应 Cookie。
-- 控制与转发都走守护进程 9317；扩展 `background.js` 只做转发，`popup.js` 只做控制。
+- 控制与转发都走守护进程 9317，统一在扩展 `background.js` 里完成（左键打开页面、右键重启/停止）。
 - 三个组件里，只有 DSH 插件包的 `fetch_page` 工具是会话级挂载；守护进程（launchd）、扩展都是常驻的。

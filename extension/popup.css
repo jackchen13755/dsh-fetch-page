@@ -1,9 +1,0 @@
-* { box-sizing: border-box; }
-body { margin: 0; font-family: system-ui, -apple-system, sans-serif; font-size: 13px; }
-.wrap { padding: 12px; min-width: 180px; background: #18181c; color: #ececf0; }
-.title { font-weight: 600; margin-bottom: 8px; }
-.status { font-size: 12px; opacity: 0.8; min-height: 16px; margin-bottom: 10px; word-break: break-all; }
-.buttons { display: flex; gap: 8px; }
-.btn { flex: 1; padding: 6px 0; cursor: pointer; border-radius: 6px;
-  border: 1px solid rgba(140,140,150,0.4); background: rgba(255,255,255,0.08); color: inherit; }
-.btn.danger { border-color: rgba(230,90,90,0.6); }

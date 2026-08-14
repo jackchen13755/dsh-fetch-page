@@ -1,4 +1,7 @@
 const BASE = 'http://127.0.0.1:9317';
+const DSH_URL = 'http://127.0.0.1:3080';
+
+// ── 请求转发（浏览器带 Cookie 抓取）──────────────────────────────────────
 
 async function forwardFetch(req) {
   try {
@@ -39,3 +42,53 @@ function start() { if (running) return; running = true; loop(); }
 start();
 chrome.alarms.create('forward-loop', { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'forward-loop') start(); });
+
+// ── DSH 生命周期控制 ─────────────────────────────────────────────────────
+
+async function ctl(action) {
+  try {
+    const r = await fetch(BASE + '/' + action, { method: action === 'status' ? 'GET' : 'POST' });
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: String(e && e.message || e) };
+  }
+}
+
+// 已有 DSH 页面则定位（激活并聚焦）该标签页，否则新建标签页。
+function openPage() {
+  chrome.tabs.query({}, (tabs) => {
+    const found = tabs.find((t) => t.url && t.url.startsWith(DSH_URL));
+    if (found) {
+      chrome.tabs.update(found.id, { active: true });
+      chrome.windows.update(found.windowId, { focused: true });
+    } else {
+      chrome.tabs.create({ url: DSH_URL });
+    }
+  });
+}
+
+// 左键点击图标：已启动 → 直接打开页面；未启动 → 启动后打开。
+chrome.action.onClicked.addListener(async () => {
+  const s = await ctl('status');
+  if (s.ok && s.running) {
+    openPage();
+    return;
+  }
+  const r = await ctl('start');
+  if (r.ok) openPage();
+});
+
+// 右键图标：重启 / 停止（幂等重建，兼容 service worker 重启）。
+chrome.contextMenus.removeAll(() => {
+  chrome.contextMenus.create({ id: 'dsh-restart', title: '重启 DSH', contexts: ['action'] });
+  chrome.contextMenus.create({ id: 'dsh-stop', title: '停止 DSH', contexts: ['action'] });
+});
+
+chrome.contextMenus.onClicked.addListener(async (info) => {
+  if (info.menuItemId === 'dsh-restart') {
+    const r = await ctl('restart');
+    if (r.ok) openPage();
+  } else if (info.menuItemId === 'dsh-stop') {
+    await ctl('stop');
+  }
+});
