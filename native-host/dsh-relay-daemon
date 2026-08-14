@@ -1,0 +1,72 @@
+#!/usr/local/bin/node
+'use strict';
+const http = require('http');
+const PORT = 9317;
+let seq = 0;
+const pending = [];
+const waiters = [];
+const results = new Map();
+
+function respond(res, obj, status) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status || 200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+  res.end(body);
+}
+
+const server = http.createServer(function (req, res) {
+  if (req.method === 'GET' && req.url === '/pending') {
+    while (pending.length > 0 && Date.now() - pending[0].at > 30000) pending.shift();
+    if (pending.length > 0) { respond(res, pending.shift()); return; }
+    const w = { res: res, timer: null };
+    w.timer = setTimeout(function () {
+      const i = waiters.indexOf(w);
+      if (i >= 0) waiters.splice(i, 1);
+      respond(res, { id: null });
+    }, 25000);
+    waiters.push(w);
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/result') {
+    let data = '';
+    req.on('data', function (c) { data += c; });
+    req.on('end', function () {
+      let msg = {};
+      try { msg = JSON.parse(data); } catch (e) {}
+      const entry = results.get(msg.id);
+      if (entry) { clearTimeout(entry.timer); results.delete(msg.id); entry.resolve(msg); }
+      respond(res, { ok: true });
+    });
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/forward') {
+    let data = '';
+    req.on('data', function (c) { data += c; });
+    req.on('end', function () {
+      let fwd = {};
+      try { fwd = JSON.parse(data); } catch (e) {}
+      if (!fwd || !fwd.url) { respond(res, { error: 'missing url' }, 400); return; }
+      const id = 'f' + (++seq) + '-' + Date.now();
+      const req2 = { id: id, url: fwd.url, method: fwd.method || 'GET', headers: fwd.headers || {}, body: fwd.body || null, at: Date.now() };
+      const timer = setTimeout(function () {
+        results.delete(id);
+        respond(res, { error: '转发超时：浏览器扩展未连接或未响应' });
+      }, 30000);
+      results.set(id, {
+        timer: timer,
+        resolve: function (msg) {
+          clearTimeout(timer);
+          results.delete(id);
+          respond(res, { status: msg.status, statusText: msg.statusText, headers: msg.headers, body: msg.body });
+        },
+      });
+      if (waiters.length > 0) { const w = waiters.shift(); clearTimeout(w.timer); respond(w.res, req2); }
+      else { pending.push(req2); }
+    });
+    return;
+  }
+  respond(res, { error: 'not found' }, 404);
+});
+
+server.listen(PORT, '127.0.0.1', function () {
+  console.log('dsh-relay-daemon on 127.0.0.1:' + PORT);
+});

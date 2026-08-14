@@ -1,0 +1,7 @@
+{
+  "name": "com.dsh.control",
+  "description": "DSH web service lifecycle control",
+  "path": "/absolute/path/to/native-host/dsh-control-host",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://gmhbeifoddcbdnajnhhghdfojmhlojgb/"]
+}

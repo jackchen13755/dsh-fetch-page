@@ -1,0 +1,91 @@
+#!/usr/local/bin/node
+'use strict';
+const { execFile } = require('child_process');
+const os = require('os');
+const path = require('path');
+
+const D = process.env.DSH_CHECKOUT || path.join(os.homedir(), 'deepseek-harness');
+const PORT = 3080;
+const URL = 'http://127.0.0.1:' + PORT;
+const LOG = '/tmp/dsh-web-' + PORT + '.log';
+const DAEMON_PATH = path.join(__dirname, 'dsh-relay-daemon');
+const DAEMON_PORT = 9317;
+
+function sh(cmd) {
+  return new Promise((resolve) => {
+    execFile('/bin/bash', ['-c', cmd], { timeout: 60000 }, (err, stdout, stderr) => {
+      resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout: String(stdout), stderr: String(stderr) });
+    });
+  });
+}
+
+function ensureDaemon() {
+  execFile('/bin/bash', ['-c', 'lsof -ti tcp:' + DAEMON_PORT + ' -sTCP:LISTEN >/dev/null 2>&1 || (nohup /usr/local/bin/node ' + DAEMON_PATH + ' > /tmp/dsh-relay-daemon.log 2>&1 &)'], {}, function () {});
+}
+
+async function currentPid() {
+  const r = await sh('lsof -ti tcp:' + PORT + ' -sTCP:LISTEN 2>/dev/null | head -1');
+  return r.stdout.trim();
+}
+
+async function startService() {
+  await sh('cd ' + D + ' && nohup /usr/local/bin/node apps/cli/lib/bin.js web --port ' + PORT + ' > ' + LOG + ' 2>&1 &');
+  await sh('for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do lsof -ti tcp:' + PORT + ' -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 1; done');
+}
+
+async function waitFree() {
+  await sh('for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do lsof -ti tcp:' + PORT + ' -sTCP:LISTEN >/dev/null 2>&1 || break; sleep 1; done');
+}
+
+async function handle(action) {
+  try {
+    if (action === 'status') {
+      const pid = await currentPid();
+      return { ok: true, running: !!pid, pid: pid || null };
+    }
+    if (action === 'start') {
+      const pid = await currentPid();
+      if (pid) return { ok: true, running: true, pid: pid, status: 'already-running' };
+      await startService();
+      return { ok: true, running: true, status: 'started' };
+    }
+    if (action === 'stop') {
+      const pid = await currentPid();
+      if (!pid) return { ok: true, running: false, status: 'not-running' };
+      await sh('kill ' + pid);
+      return { ok: true, running: false, status: 'stopped', pid: pid };
+    }
+    if (action === 'restart') {
+      const pid = await currentPid();
+      if (!pid) { await startService(); return { ok: true, running: true, status: 'started' }; }
+      await sh('kill ' + pid);
+      await waitFree();
+      await startService();
+      return { ok: true, running: true, status: 'restarted', oldPid: pid };
+    }
+    return { ok: false, error: 'unknown action: ' + action };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message || e) };
+  }
+}
+
+ensureDaemon();
+
+let buf = Buffer.alloc(0);
+process.stdin.on('data', (chunk) => {
+  buf = Buffer.concat([buf, chunk]);
+  while (buf.length >= 4) {
+    const len = buf.readUInt32LE(0);
+    if (buf.length < 4 + len) break;
+    const raw = buf.slice(4, 4 + len);
+    buf = buf.slice(4 + len);
+    let msg = {};
+    try { msg = JSON.parse(raw.toString('utf8')); } catch (e) {}
+    handle(msg && msg.action).then((resp) => {
+      const body = Buffer.from(JSON.stringify(resp), 'utf8');
+      const head = Buffer.alloc(4);
+      head.writeUInt32LE(body.length, 0);
+      process.stdout.write(Buffer.concat([head, body]));
+    });
+  }
+});
