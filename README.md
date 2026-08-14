@@ -6,7 +6,7 @@
 - **转发守护进程**（`daemon/`）：常驻本地 HTTP 服务，既是转发中转，也负责 DSH 进程的生命周期控制（status / start / stop / restart）。
 - **DSH 常驻插件**（`dsh-plugin/`）：为 Agent 提供 `fetch_page` 工具，把 HTTP 请求交给守护进程、经浏览器用当前登录 Cookie 抓取页面并绕过 CORS。
 
-不再使用 Chrome 原生消息宿主（native messaging host）：控制与转发统一走守护进程的 HTTP 接口。
+控制与转发统一走守护进程的 HTTP 接口。原生消息宿主（native messaging host，`com.dsh.control`）仅作「启动兜底」：扩展 service worker 加载时唤起一次宿主，由宿主确保守护进程在运行；宿主未安装时静默降级，不影响正常功能。
 
 ## 架构
 
@@ -20,6 +20,7 @@ DSH fetch_page 工具 ──POST /forward──▶ 守护进程 127.0.0.1:9317 �
 
 - 守护进程独立于 DSH 常驻运行（launchd 保活），DSH 重启后转发链路不丢。
 - 扩展后台持续长轮询守护进程，并通过 `fetch` 调守护进程的控制端点。
+- 扩展加载时经 native messaging 唤起一次宿主，确保守护进程在运行（launchd 未装或守护进程意外退出时可自愈）；宿主未安装则静默降级。
 
 ## 安装
 
@@ -28,6 +29,8 @@ DSH fetch_page 工具 ──POST /forward──▶ 守护进程 127.0.0.1:9317 �
 1. 打开 `chrome://extensions`，开启右上角「开发者模式」。
 2. 点「加载已解压的扩展程序」，选择本仓库的 `extension/` 目录。
 3. 记住扩展 ID（或保持 `manifest.json` 里的 `key` 不变，扩展 ID 固定为 `gmhbeifoddcbdnajnhhghdfojmhlojgb`）。
+
+> 扩展声明了 `nativeMessaging` 权限，用于启动时经宿主 `com.dsh.control` 确保守护进程在运行。宿主未安装时静默降级，仅失去「启动自愈」兜底，不影响控制与转发。
 
 ### 2. 启动守护进程（launchd 常驻）
 
