@@ -40,6 +40,16 @@ let running = false;
 async function loop() { while (true) { await pollOnce(); } }
 function start() { if (running) return; running = true; loop(); }
 start();
+
+// ── 启动时确保守护进程运行：经 native messaging 唤起 host 的 ensureDaemon ──
+// 扩展加载/唤醒时轻量唤起一次；daemon 已在运行则 no-op。host 缺失或未注册时
+// 静默降级，daemon 仍由 launchd / fetch_page 的 ensureDaemon 兜底启动。
+try {
+  chrome.runtime.sendNativeMessage('com.dsh.control', { action: 'status' }, () => {
+    void chrome.runtime.lastError;
+  });
+} catch (e) {}
+
 chrome.alarms.create('forward-loop', { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'forward-loop') start(); });
 
