@@ -1,21 +1,25 @@
 # DSH 控制与网页转发（dsh-fetch-page）
 
-一套让 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) 具备「浏览器登录态抓取」能力的工具链，由三个部分组成：
+一套让 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) 具备「浏览器登录态抓取」能力的工具链，由三部分组成：
 
 - **Chrome 扩展**（`extension/`）：控制 DSH web 服务的启动/重启/停止，并作为「带 Cookie 的 HTTP 转发」的浏览器端执行者。
-- **原生消息宿主 + 转发守护进程**（`native-host/`）：扩展与 DSH 之间的桥。原生宿主负责进程生命周期；守护进程是常驻的本地 HTTP 中转，使转发不依赖 DSH 存活。
+- **转发守护进程**（`daemon/`）：常驻本地 HTTP 服务，既是转发中转，也负责 DSH 进程的生命周期控制（status / start / stop / restart）。
 - **DSH 常驻插件**（`dsh-plugin/`）：为 Agent 提供 `fetch_page` 工具，把 HTTP 请求交给守护进程、经浏览器用当前登录 Cookie 抓取页面并绕过 CORS。
+
+不再使用 Chrome 原生消息宿主（native messaging host）：控制与转发统一走守护进程的 HTTP 接口。
 
 ## 架构
 
 ```
-DSH fetch_page 工具 ──curl POST──▶ 守护进程 127.0.0.1:9317 ──长轮询──▶ 扩展 background ──fetch(带 Cookie)──▶ 目标站点
-                                        ▲                                    │
-                                        └────────────── POST /result ────────┘
+                    ┌─────────────── 控制(status/start/stop/restart) ───────────────┐
+                    ▼                                                               │
+DSH fetch_page 工具 ──POST /forward──▶ 守护进程 127.0.0.1:9317 ──长轮询 /pending──▶ 扩展 background ──fetch(带 Cookie)──▶ 目标站点
+                                          ▲                                             │
+                                          └────────────────── POST /result ──────────────┘
 ```
 
-- 守护进程独立于 DSH 常驻运行，DSH 重启后转发链路不丢。
-- 扩展后台持续长轮询守护进程；`fetch_page` 工具与原生宿主都会在需要时自动拉起守护进程。
+- 守护进程独立于 DSH 常驻运行（launchd 保活），DSH 重启后转发链路不丢。
+- 扩展后台持续长轮询守护进程；扩展 popup 通过 `fetch` 调守护进程的控制端点。
 
 ## 安装
 
@@ -25,35 +29,41 @@ DSH fetch_page 工具 ──curl POST──▶ 守护进程 127.0.0.1:9317 ─�
 2. 点「加载已解压的扩展程序」，选择本仓库的 `extension/` 目录。
 3. 记住扩展 ID（或保持 `manifest.json` 里的 `key` 不变，扩展 ID 固定为 `gmhbeifoddcbdnajnhhghdfojmhlojgb`）。
 
-### 2. 注册原生消息宿主
+### 2. 启动守护进程（launchd 常驻）
 
-编辑 `native-host/com.dsh.control.json`，把 `path` 改成你机器上的 `dsh-control-host` 绝对路径：
+编辑 `daemon/com.dsh.relay.plist`，把程序参数里的守护进程路径改成你机器上的绝对路径：
 
-```json
-{
-  "name": "com.dsh.control",
-  "path": "/你的/绝对路径/native-host/dsh-control-host",
-  "type": "stdio",
-  "allowed_origins": ["chrome-extension://gmhbeifoddcbdnajnhhghdfojmhlojgb/"]
-}
+```xml
+<string>/绝对/路径/daemon/dsh-relay-daemon</string>
 ```
 
-然后复制到 Chrome 的原生消息宿主目录：
+然后安装并加载（macOS）：
 
 ```bash
-mkdir -p "$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts"
-cp native-host/com.dsh.control.json "$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts/"
+chmod +x daemon/dsh-relay-daemon
+cp daemon/com.dsh.relay.plist "$HOME/Library/LaunchAgents/com.dsh.relay.plist"
+launchctl unload "$HOME/Library/LaunchAgents/com.dsh.relay.plist" 2>/dev/null || true
+launchctl load -w "$HOME/Library/LaunchAgents/com.dsh.relay.plist"
 ```
 
-给脚本加执行权限：
+验证：
 
 ```bash
-chmod +x native-host/dsh-control-host native-host/dsh-relay-daemon
+curl http://127.0.0.1:9317/status
+# => {"ok":true,"running":false,"pid":null}   （DSH 未启动时）
 ```
 
-> 原生宿主的守护进程路径按脚本所在目录自动定位（`dsh-relay-daemon` 就在
-> 同一目录），无需修改；DSH checkout 目录默认取 `~/deepseek-harness`，若你的
-> checkout 在别处，给宿主进程设置环境变量 `DSH_CHECKOUT` 指向它即可。
+守护进程相关环境变量（可选，设置给 launchd 或手动启动时）：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DSH_CHECKOUT` | `~/deepseek-harness` | DSH checkout 目录 |
+| `DSH_PORT` | `3080` | DSH web 端口 |
+| `DSH_DAEMON_PORT` | `9317` | 守护进程监听端口 |
+| `DSH_START_CMD` | `node apps/cli/lib/bin.js web --port 3080` | DSH 启动命令（整条覆盖） |
+
+> 开发模式用户可把 `DSH_START_CMD` 设为
+> `node --import tsx/esm apps/cli/src/bin.ts web --port 3080`。
 
 ### 3. 安装 DSH 常驻插件
 
@@ -75,7 +85,7 @@ pnpm install
   name: '@deepseek-ai/dsh-tool-fetch-page'
   config:
     daemonUrl: http://127.0.0.1:9317
-    daemonPath: /你的/绝对路径/native-host/dsh-relay-daemon
+    daemonPath: /你的/绝对路径/daemon/dsh-relay-daemon
     workspaceRoot: /你的/工作目录
 ```
 
@@ -98,6 +108,8 @@ pnpm install
 - **未启动**：自动启动 DSH 服务并打开 `http://127.0.0.1:3080`。
 - **已启动**：展开「重启 / 停止」按钮。
 
+控制请求由 popup 直接 `fetch` 守护进程的 `/status`、`/start`、`/stop`、`/restart` 端点完成。
+
 ### 抓取登录态页面
 
 在 DSH 会话里直接调用 `fetch_page` 工具：
@@ -118,4 +130,5 @@ fetch_page url=https://example.com/private/page
 
 - 扩展后台通过 `chrome.alarms` 兜底恢复轮询；守护进程长轮询 25s，转发请求超时 30s。
 - 扩展必须登录目标站点，转发才会带上对应 Cookie。
-- 三个组件里，只有 DSH 插件包的 `fetch_page` 工具是会话级挂载；守护进程、原生宿主、扩展都是常驻的。
+- 控制与转发都走守护进程 9317；扩展 `background.js` 只做转发，`popup.js` 只做控制。
+- 三个组件里，只有 DSH 插件包的 `fetch_page` 工具是会话级挂载；守护进程（launchd）、扩展都是常驻的。

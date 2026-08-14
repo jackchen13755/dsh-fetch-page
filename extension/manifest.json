@@ -11,6 +11,6 @@
   "background": {
     "service_worker": "background.js"
   },
-  "permissions": ["nativeMessaging", "alarms"],
+  "permissions": ["alarms"],
   "host_permissions": ["<all_urls>"]
 }

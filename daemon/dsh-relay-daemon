@@ -1,0 +1,180 @@
+#!/usr/bin/env node
+'use strict';
+const http = require('http');
+const { execFile } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const PORT = Number(process.env.DSH_DAEMON_PORT || 9317);
+const DSH_DIR = process.env.DSH_CHECKOUT || path.join(os.homedir(), 'deepseek-harness');
+const DSH_PORT = Number(process.env.DSH_PORT || 3080);
+const DSH_LOG = '/tmp/dsh-web-' + DSH_PORT + '.log';
+const CTL_LOG = '/tmp/dsh-relay-daemon.log';
+const LSOF = '/usr/sbin/lsof';
+const NODE = process.execPath;
+// DSH 启动命令。默认用编译产物（生产模式）；开发模式可整条覆盖，例如：
+//   DSH_START_CMD="node --import tsx/esm apps/cli/src/bin.ts web --port 3080"
+const DSH_START = process.env.DSH_START_CMD || (NODE + ' apps/cli/lib/bin.js web --port ' + DSH_PORT);
+
+// ---- 转发状态 ----
+let seq = 0;
+const pending = [];
+const waiters = [];
+const results = new Map();
+
+function log(msg) {
+  try { fs.appendFileSync(CTL_LOG, new Date().toISOString() + ' ' + msg + '\n'); } catch (e) {}
+}
+
+function respond(res, obj, status) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status || 200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  });
+  res.end(body);
+}
+
+function sh(cmd) {
+  return new Promise((resolve) => {
+    execFile('/bin/bash', ['-c', cmd], { timeout: 30000 }, (err, stdout, stderr) => {
+      resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout: String(stdout), stderr: String(stderr) });
+    });
+  });
+}
+
+async function currentPid() {
+  const r = await sh(LSOF + ' -ti tcp:' + DSH_PORT + ' -sTCP:LISTEN 2>/dev/null | head -1');
+  return r.stdout.trim();
+}
+
+// 先 SIGTERM 优雅退出，3 秒没退就 SIGKILL 强杀。
+async function killPid(pid) {
+  log('kill SIGTERM ' + pid);
+  await sh('kill ' + pid + ' 2>/dev/null || true');
+  await sh('for ((i=0;i<3;i++)); do ps -p ' + pid + ' >/dev/null 2>&1 || break; sleep 1; done');
+  const alive = await sh('ps -p ' + pid + ' >/dev/null 2>&1 && echo yes || echo no');
+  if (alive.stdout.trim() === 'yes') {
+    log('still alive, SIGKILL ' + pid);
+    await sh('kill -9 ' + pid + ' 2>/dev/null || true');
+    await sh('sleep 1');
+  }
+}
+
+async function waitFree(secs) {
+  await sh('for ((i=0;i<' + secs + ';i++)); do ' + LSOF + ' -ti tcp:' + DSH_PORT + ' -sTCP:LISTEN >/dev/null 2>&1 || break; sleep 1; done');
+}
+
+async function startDsh() {
+  log('startDsh');
+  await sh('cd ' + DSH_DIR + ' && nohup ' + DSH_START + ' > ' + DSH_LOG + ' 2>&1 &');
+  await sh('for ((i=0;i<15;i++)); do ' + LSOF + ' -ti tcp:' + DSH_PORT + ' -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 1; done');
+  const pid = await currentPid();
+  log('started pid=' + pid);
+  return pid;
+}
+
+async function ctlStatus() {
+  const pid = await currentPid();
+  return { ok: true, running: !!pid, pid: pid || null };
+}
+async function ctlStart() {
+  const pid = await currentPid();
+  if (pid) return { ok: true, running: true, pid: pid, status: 'already-running' };
+  const np = await startDsh();
+  return { ok: true, running: !!np, pid: np || null, status: 'started' };
+}
+async function ctlStop() {
+  const pid = await currentPid();
+  if (!pid) return { ok: true, running: false, status: 'not-running' };
+  await killPid(pid);
+  return { ok: true, running: false, status: 'stopped', pid: pid };
+}
+async function ctlRestart() {
+  const pid = await currentPid();
+  if (pid) { await killPid(pid); await waitFree(5); }
+  const np = await startDsh();
+  return { ok: true, running: !!np, pid: np || null, status: 'restarted', oldPid: pid || null };
+}
+
+const server = http.createServer(function (req, res) {
+  // ---- 生命周期控制端点 ----
+  if (req.method === 'GET' && req.url === '/status') {
+    ctlStatus().then((r) => respond(res, r), (e) => respond(res, { ok: false, error: String((e && e.message) || e) }, 500));
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/start') {
+    ctlStart().then((r) => respond(res, r), (e) => respond(res, { ok: false, error: String((e && e.message) || e) }, 500));
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/stop') {
+    ctlStop().then((r) => respond(res, r), (e) => respond(res, { ok: false, error: String((e && e.message) || e) }, 500));
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/restart') {
+    ctlRestart().then((r) => respond(res, r), (e) => respond(res, { ok: false, error: String((e && e.message) || e) }, 500));
+    return;
+  }
+  if (req.method === 'OPTIONS') { respond(res, { ok: true }); return; }
+
+  // ---- 转发端点 ----
+  if (req.method === 'GET' && req.url === '/pending') {
+    while (pending.length > 0 && Date.now() - pending[0].at > 30000) pending.shift();
+    if (pending.length > 0) { respond(res, pending.shift()); return; }
+    const w = { res: res, timer: null };
+    w.timer = setTimeout(function () {
+      const i = waiters.indexOf(w);
+      if (i >= 0) waiters.splice(i, 1);
+      respond(res, { id: null });
+    }, 25000);
+    waiters.push(w);
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/result') {
+    let data = '';
+    req.on('data', function (c) { data += c; });
+    req.on('end', function () {
+      let msg = {};
+      try { msg = JSON.parse(data); } catch (e) {}
+      const entry = results.get(msg.id);
+      if (entry) { clearTimeout(entry.timer); results.delete(msg.id); entry.resolve(msg); }
+      respond(res, { ok: true });
+    });
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/forward') {
+    let data = '';
+    req.on('data', function (c) { data += c; });
+    req.on('end', function () {
+      let fwd = {};
+      try { fwd = JSON.parse(data); } catch (e) {}
+      if (!fwd || !fwd.url) { respond(res, { error: 'missing url' }, 400); return; }
+      const id = 'f' + (++seq) + '-' + Date.now();
+      const req2 = { id: id, url: fwd.url, method: fwd.method || 'GET', headers: fwd.headers || {}, body: fwd.body || null, at: Date.now() };
+      const timer = setTimeout(function () {
+        results.delete(id);
+        respond(res, { error: '转发超时：浏览器扩展未连接或未响应' });
+      }, 30000);
+      results.set(id, {
+        timer: timer,
+        resolve: function (msg) {
+          clearTimeout(timer);
+          results.delete(id);
+          respond(res, { status: msg.status, statusText: msg.statusText, headers: msg.headers, body: msg.body });
+        },
+      });
+      if (waiters.length > 0) { const w = waiters.shift(); clearTimeout(w.timer); respond(w.res, req2); }
+      else { pending.push(req2); }
+    });
+    return;
+  }
+
+  respond(res, { error: 'not found' }, 404);
+});
+
+server.listen(PORT, '127.0.0.1', function () {
+  console.log('dsh-relay-daemon on 127.0.0.1:' + PORT);
+});
