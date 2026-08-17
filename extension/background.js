@@ -42,7 +42,8 @@ function start() { if (running) return; running = true; loop(); }
 start();
 
 chrome.alarms.create('forward-loop', { periodInMinutes: 0.5 });
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'forward-loop') start(); });
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'forward-loop') { start(); updateIcon(); } });
+updateIcon();
 
 // ── DSH 生命周期控制 ─────────────────────────────────────────────────────
 
@@ -56,14 +57,23 @@ async function ctl(action) {
 }
 
 // 系统通知 + 图标角标反馈
-function notify(title, message) {
+function notify(title, message, ok) {
   try {
     chrome.notifications.create({
       type: 'basic',
-      iconUrl: chrome.runtime.getURL('icon.png'),
+      iconUrl: chrome.runtime.getURL(ok === false ? 'icon-stopped.png' : 'icon-running.png'),
       title: title,
       message: message,
     });
+  } catch (e) {}
+}
+
+// 根据 DSH 是否在运行切换图标颜色（绿=运行，灰=停止）
+async function updateIcon() {
+  try {
+    const s = await ctl('status');
+    const path = (s.ok && s.running) ? 'icon-running.png' : 'icon-stopped.png';
+    chrome.action.setIcon({ path: { 128: path } });
   } catch (e) {}
 }
 
@@ -97,7 +107,8 @@ chrome.action.onClicked.addListener(async () => {
   }
   const r = await ctl('start');
   if (r.ok) openPage();
-  else { notify('启动失败', r.error || '未知错误'); flashBadge(false); }
+  else { notify('启动失败', r.error || '未知错误', false); flashBadge(false); }
+  updateIcon();
 });
 
 // 右键图标：重启 / 停止（幂等重建，兼容 service worker 重启）。
@@ -114,12 +125,14 @@ chrome.contextMenus.onClicked.addListener(async (info) => {
       flashBadge(true);
       openPage();
     } else {
-      notify('重启失败', r.error || '未知错误');
+      notify('重启失败', r.error || '未知错误', false);
       flashBadge(false);
     }
+    updateIcon();
   } else if (info.menuItemId === 'dsh-stop') {
     const r = await ctl('stop');
     if (r.ok) { notify('已停止', 'DSH 已停止'); flashBadge(true); }
-    else { notify('停止失败', r.error || '未知错误'); flashBadge(false); }
+    else { notify('停止失败', r.error || '未知错误', false); flashBadge(false); }
+    updateIcon();
   }
 });
