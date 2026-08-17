@@ -3,6 +3,7 @@
   "name": "DSH 控制",
   "version": "1.2.0",
   "description": "DSH web 服务启动/重启/停止控制与请求转发",
+  "icons": { "128": "icon.png" },
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp8G8eIsgwRRLw6+15dXTAsaBQejXmmALI4K9eLJDPCvqsZTqr7v3htYfnFfOCU5yOG7SQk+6mMTMo2+KBJQwCwcFYua2L4lP3nebXRC6yywYOXfDcF9m+ZdsvBwL8ZK2sZ0m0ysuHZsOv61NPvhTuT8RV+XV+AGEoAo0EW1+aYBC/KHMuqgmspGlzcBo9qq4GoOlj989SxIKeU0GvRhSaGexJeu7PfpJEJrzAqDJ2/biz6QX34wpCT5/GH97wr6TsPdy84VBMe6jemi83ip6MWe7jlNlWeIUgGPriM72A87RrafrSJlseuXL64r3+1Ck9JcLwjqEoHbRmmdqAvRTlQIDAQAB",
   "action": {
     "default_title": "DSH 控制"
@@ -10,6 +11,6 @@
   "background": {
     "service_worker": "background.js"
   },
-  "permissions": ["alarms", "contextMenus", "nativeMessaging"],
+  "permissions": ["alarms", "contextMenus", "notifications"],
   "host_permissions": ["<all_urls>"]
 }

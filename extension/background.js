@@ -41,15 +41,6 @@ async function loop() { while (true) { await pollOnce(); } }
 function start() { if (running) return; running = true; loop(); }
 start();
 
-// ── 启动时确保守护进程运行：经 native messaging 唤起 host 的 ensureDaemon ──
-// 扩展加载/唤醒时轻量唤起一次；daemon 已在运行则 no-op。host 缺失或未注册时
-// 静默降级，daemon 仍由 launchd / fetch_page 的 ensureDaemon 兜底启动。
-try {
-  chrome.runtime.sendNativeMessage('com.dsh.control', { action: 'status' }, () => {
-    void chrome.runtime.lastError;
-  });
-} catch (e) {}
-
 chrome.alarms.create('forward-loop', { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'forward-loop') start(); });
 
@@ -62,6 +53,26 @@ async function ctl(action) {
   } catch (e) {
     return { ok: false, error: String(e && e.message || e) };
   }
+}
+
+// 系统通知 + 图标角标反馈
+function notify(title, message) {
+  try {
+    chrome.notifications.create({
+      type: 'basic',
+      iconUrl: chrome.runtime.getURL('icon.png'),
+      title: title,
+      message: message,
+    });
+  } catch (e) {}
+}
+
+function flashBadge(ok) {
+  try {
+    chrome.action.setBadgeBackgroundColor({ color: ok ? '#188038' : '#d93025' });
+    chrome.action.setBadgeText({ text: ok ? '成功' : '失败' });
+    setTimeout(() => chrome.action.setBadgeText({ text: '' }), 4000);
+  } catch (e) {}
 }
 
 // 已有 DSH 页面则定位（激活并聚焦）该标签页，否则新建标签页。
@@ -86,6 +97,7 @@ chrome.action.onClicked.addListener(async () => {
   }
   const r = await ctl('start');
   if (r.ok) openPage();
+  else { notify('启动失败', r.error || '未知错误'); flashBadge(false); }
 });
 
 // 右键图标：重启 / 停止（幂等重建，兼容 service worker 重启）。
@@ -97,8 +109,17 @@ chrome.contextMenus.removeAll(() => {
 chrome.contextMenus.onClicked.addListener(async (info) => {
   if (info.menuItemId === 'dsh-restart') {
     const r = await ctl('restart');
-    if (r.ok) openPage();
+    if (r.ok) {
+      notify('重启成功', 'DSH 已重启' + (r.pid ? ' · PID ' + r.pid : ''));
+      flashBadge(true);
+      openPage();
+    } else {
+      notify('重启失败', r.error || '未知错误');
+      flashBadge(false);
+    }
   } else if (info.menuItemId === 'dsh-stop') {
-    await ctl('stop');
+    const r = await ctl('stop');
+    if (r.ok) { notify('已停止', 'DSH 已停止'); flashBadge(true); }
+    else { notify('停止失败', r.error || '未知错误'); flashBadge(false); }
   }
 });
