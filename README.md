@@ -2,8 +2,8 @@
 
 一套让 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) 具备「浏览器登录态抓取」能力的工具链，由三部分组成：
 
-- **Chrome 扩展**（`extension/`）：控制 DSH web 服务的启动/重启/停止，并作为「带 Cookie 的 HTTP 转发」的浏览器端执行者。
-- **转发守护进程**（`daemon/`）：常驻本地 HTTP 服务，既是转发中转，也负责 DSH 进程的生命周期控制（status / start / stop / restart）。
+- **Chrome 扩展**（`extension/`）：控制 DSH web 服务的启动/重启/停止，定时检查 DSH 新版本、一键更新并重新构建，并作为「带 Cookie 的 HTTP 转发」的浏览器端执行者。
+- **转发守护进程**（`daemon/`）：常驻本地 HTTP 服务，既是转发中转，也负责 DSH 进程的生命周期控制与版本检查/更新（status / start / stop / restart / version / update-check / update）。
 - **DSH 常驻插件**（`dsh-plugin/`）：为 Agent 提供 `fetch_page` 工具，把 HTTP 请求交给守护进程、经浏览器用当前登录 Cookie 抓取页面并绕过 CORS。
 
 控制与转发统一走守护进程的 HTTP 接口。原生消息宿主（native messaging host，`com.dsh.control`）仅作「启动兜底」：扩展 service worker 加载时唤起一次宿主，由宿主确保守护进程在运行；宿主未安装时静默降级，不影响正常功能。
@@ -64,6 +64,8 @@ curl http://127.0.0.1:9317/status
 | `DSH_PORT` | `3080` | DSH web 端口 |
 | `DSH_DAEMON_PORT` | `9317` | 守护进程监听端口 |
 | `DSH_START_CMD` | `node apps/cli/lib/bin.js web --port 3080` | DSH 启动命令（整条覆盖） |
+| `DSH_REMOTE` | `origin` | 版本检查/更新使用的 git remote 名 |
+| `DSH_REPO_URL` | `https://github.com/deepseek-ai/deepseek-harness` | 版本对比链接使用的仓库地址 |
 
 > 开发模式用户可把 `DSH_START_CMD` 设为
 > `node --import tsx/esm apps/cli/src/bin.ts web --port 3080`。
@@ -113,6 +115,16 @@ pnpm install
 
 控制请求由后台 service worker 直接 `fetch` 守护进程的 `/status`、`/start`、`/stop`、`/restart` 端点完成。
 
+### 版本检查与一键更新
+
+扩展会定时（默认每 6 小时）调用守护进程的 `/update-check`，对比本地 DSH checkout 与远端分支：
+
+- **当前版本**：右键菜单第一项固定显示，格式为 `package.json 版本 (git commit)`。
+- **新版本提示**：发现远端有更新时，系统通知会显示当前版本 → 最新版本，并提供「下载并重建」按钮；扩展图标角标显示「新」，右键菜单中的「下载并重建 DSH」变为可点击。
+- **一键更新**：点击后守护进程会依次执行：停止 DSH → 暂存本地已跟踪修改 → `git merge --ff-only` 拉取远端 → 恢复本地修改 → 安装依赖 → 重新构建 → 按需重启 DSH。
+- **本地内容保护**：未跟踪的本地插件、`~/.dsh` 下的 profile/设置不会被改动；已跟踪的本地修改会先 `git stash`，拉取完成后自动 `stash pop` 恢复。若恢复时出现冲突，会保留在工作区、停止自动构建并提示手动处理，不会静默覆盖。
+- 手动检查/更新可通过右键菜单「检查 DSH 更新」「下载并重建 DSH」触发；更新进度由扩展后台轮询 `/update-status`，完成后发送通知。
+
 ### 抓取登录态页面
 
 在 DSH 会话里直接调用 `fetch_page` 工具：
@@ -133,5 +145,6 @@ fetch_page url=https://example.com/private/page
 
 - 扩展后台通过 `chrome.alarms` 兜底恢复轮询；守护进程长轮询 25s，转发请求超时 30s。
 - 扩展必须登录目标站点，转发才会带上对应 Cookie。
-- 控制与转发都走守护进程 9317，统一在扩展 `background.js` 里完成（左键打开页面、右键重启/停止）。
+- 控制与转发都走守护进程 9317，统一在扩展 `background.js` 里完成（左键打开页面、右键版本/更新/重启/停止）。
+- 版本检查与更新也走守护进程 9317：`/version`、`/update-check`、`/update`、`/update-status`。
 - 三个组件里，只有 DSH 插件包的 `fetch_page` 工具是会话级挂载；守护进程（launchd）、扩展都是常驻的。

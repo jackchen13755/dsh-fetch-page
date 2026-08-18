@@ -1,6 +1,12 @@
 const BASE = 'http://127.0.0.1:9317';
 const DSH_URL = 'http://127.0.0.1:3080';
 
+const VERSION_ALARM = 'dsh-version-check';
+const UPDATE_POLL_ALARM = 'dsh-update-poll';
+const UPDATE_NOTIFICATION_ID = 'dsh-update';
+const CHECK_INTERVAL_MINUTES = 6 * 60;
+const POLL_INTERVAL_MINUTES = 0.5;
+
 // ── 请求转发（浏览器带 Cookie 抓取）──────────────────────────────────────
 
 async function forwardFetch(req) {
@@ -42,7 +48,12 @@ function start() { if (running) return; running = true; loop(); }
 start();
 
 chrome.alarms.create('forward-loop', { periodInMinutes: 0.5 });
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'forward-loop') { start(); updateIcon(); } });
+chrome.alarms.create(VERSION_ALARM, { periodInMinutes: CHECK_INTERVAL_MINUTES });
+chrome.alarms.onAlarm.addListener((a) => {
+  if (a.name === 'forward-loop') { start(); updateIcon(); }
+  else if (a.name === VERSION_ALARM) { checkForUpdates(false); }
+  else if (a.name === UPDATE_POLL_ALARM) { pollUpdateStatus(); }
+});
 updateIcon();
 
 // ── DSH 生命周期控制 ─────────────────────────────────────────────────────
@@ -111,14 +122,145 @@ chrome.action.onClicked.addListener(async () => {
   updateIcon();
 });
 
-// 右键图标：重启 / 停止（幂等重建，兼容 service worker 重启）。
-chrome.contextMenus.removeAll(() => {
-  chrome.contextMenus.create({ id: 'dsh-restart', title: '重启 DSH', contexts: ['action'] });
-  chrome.contextMenus.create({ id: 'dsh-stop', title: '停止 DSH', contexts: ['action'] });
+// ── DSH 版本检查 / 更新 ──────────────────────────────────────────────────
+
+function formatVersion(v) {
+  if (!v) return '未知';
+  if (v.packageVersion && v.shortCommit) return v.packageVersion + ' (' + v.shortCommit + ')';
+  return v.packageVersion || v.shortCommit || v.commit || '未知';
+}
+
+// 重建右键菜单：第一项固定展示当前版本；有更新时“下载并重建”才可点。
+function rebuildContextMenus(info) {
+  const hasUpdate = !!(info && info.hasUpdate);
+  const currentLabel = formatVersion(info && info.current);
+  const latestLabel = formatVersion(info && info.latest);
+  chrome.contextMenus.removeAll(() => {
+    chrome.contextMenus.create({
+      id: 'dsh-version',
+      title: '当前 DSH 版本: ' + currentLabel,
+      contexts: ['action'],
+      enabled: false,
+    });
+    chrome.contextMenus.create({ id: 'dsh-check-update', title: '检查 DSH 更新', contexts: ['action'] });
+    chrome.contextMenus.create({
+      id: 'dsh-update',
+      title: hasUpdate ? '下载并重建 DSH (' + latestLabel + ')' : '下载并重建 DSH',
+      contexts: ['action'],
+      enabled: hasUpdate,
+    });
+    chrome.contextMenus.create({ id: 'dsh-sep', type: 'separator', contexts: ['action'] });
+    chrome.contextMenus.create({ id: 'dsh-restart', title: '重启 DSH', contexts: ['action'] });
+    chrome.contextMenus.create({ id: 'dsh-stop', title: '停止 DSH', contexts: ['action'] });
+  });
+}
+
+async function checkForUpdates(manual) {
+  let info;
+  try {
+    const r = await fetch(BASE + '/update-check', { signal: AbortSignal.timeout(120000) });
+    info = await r.json();
+  } catch (e) {
+    if (manual) notify('检查失败', '无法连接本地守护进程', false);
+    return;
+  }
+  if (!info || !info.ok) {
+    if (manual) notify('检查失败', (info && info.error) || '未知错误', false);
+    return;
+  }
+
+  const currentLabel = formatVersion(info.current);
+  const latestLabel = formatVersion(info.latest);
+  chrome.action.setTitle({
+    title: 'DSH 控制\n当前版本: ' + currentLabel + (info.hasUpdate ? '\n有新版本: ' + latestLabel : ''),
+  });
+  rebuildContextMenus(info);
+
+  if (info.hasUpdate) {
+    const key = (info.latest && (info.latest.commit || info.latest.packageVersion)) || 'update';
+    chrome.storage.local.get({ notifiedUpdateKey: '' }, (data) => {
+      if (data.notifiedUpdateKey === key) return;
+      chrome.notifications.create(UPDATE_NOTIFICATION_ID, {
+        type: 'basic',
+        iconUrl: chrome.runtime.getURL('icon-running.png'),
+        title: 'DSH 有新版本',
+        message: '当前 ' + currentLabel + ' → 最新 ' + latestLabel +
+          '（落后 ' + (info.behind || '?') + ' 个提交）\n点击“下载并重建”，本地插件/设置不会被覆盖。',
+        priority: 2,
+        requireInteraction: true,
+        buttons: [{ title: '下载并重建' }, { title: '稍后' }],
+      });
+      chrome.storage.local.set({ notifiedUpdateKey: key });
+    });
+    try {
+      chrome.action.setBadgeBackgroundColor({ color: '#d93025' });
+      chrome.action.setBadgeText({ text: '新' });
+    } catch (e) {}
+  } else {
+    try { chrome.action.setBadgeText({ text: '' }); } catch (e) {}
+  }
+
+  if (manual) {
+    notify('版本检查完成', info.hasUpdate ? '发现新版本 ' + latestLabel : '当前已是最新版本 ' + currentLabel, true);
+  }
+}
+
+async function startUpdate() {
+  let r;
+  try {
+    r = await (await fetch(BASE + '/update', { method: 'POST', signal: AbortSignal.timeout(10000) })).json();
+  } catch (e) {
+    notify('更新失败', '无法连接本地守护进程', false);
+    return;
+  }
+  if (!r || !r.ok || !r.started) {
+    notify('更新失败', (r && r.error) || '未知错误', false);
+    return;
+  }
+  notify('开始更新', '正在拉取最新 DSH 并重新构建，本地插件/设置会保留。', true);
+  chrome.alarms.create(UPDATE_POLL_ALARM, { periodInMinutes: POLL_INTERVAL_MINUTES });
+  pollUpdateStatus();
+}
+
+async function pollUpdateStatus() {
+  let s;
+  try {
+    s = await (await fetch(BASE + '/update-status', { signal: AbortSignal.timeout(10000) })).json();
+  } catch (e) { return; }
+  if (!s || (s.state !== 'completed' && s.state !== 'failed')) return;
+  chrome.alarms.clear(UPDATE_POLL_ALARM);
+  if (s.state === 'completed') {
+    notify('DSH 更新完成', s.message || '更新完成，本地插件/设置已保留', true);
+  } else {
+    notify('DSH 更新失败', s.error || s.message || '更新失败', false);
+  }
+  checkForUpdates(false);
+  updateIcon();
+}
+
+// 首次加载先建菜单（版本未知），随后立即检查一次版本。
+rebuildContextMenus(null);
+checkForUpdates(false);
+
+// 通知按钮：点击“下载并重建”触发更新；“稍后”只关闭。
+chrome.notifications.onButtonClicked.addListener((id, btnIndex) => {
+  if (id !== UPDATE_NOTIFICATION_ID) return;
+  chrome.notifications.clear(id);
+  if (btnIndex === 0) startUpdate();
+});
+chrome.notifications.onClicked.addListener((id) => {
+  if (id !== UPDATE_NOTIFICATION_ID) return;
+  chrome.notifications.clear(id);
+  startUpdate();
 });
 
+// 右键菜单：版本检查 / 更新 / 重启 / 停止
 chrome.contextMenus.onClicked.addListener(async (info) => {
-  if (info.menuItemId === 'dsh-restart') {
+  if (info.menuItemId === 'dsh-check-update') {
+    checkForUpdates(true);
+  } else if (info.menuItemId === 'dsh-update') {
+    startUpdate();
+  } else if (info.menuItemId === 'dsh-restart') {
     const r = await ctl('restart');
     if (r.ok) {
       notify('重启成功', 'DSH 已重启' + (r.pid ? ' · PID ' + r.pid : ''));

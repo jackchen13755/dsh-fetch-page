@@ -7,6 +7,7 @@ const os = require('os');
 const path = require('path');
 
 const PORT = Number(process.env.DSH_DAEMON_PORT || 9317);
+// 本机 DSH checkout 路径。也可用环境变量 DSH_CHECKOUT 覆盖。
 const DSH_DIR = process.env.DSH_CHECKOUT || path.join(os.homedir(), 'deepseek-harness');
 const DSH_PORT = Number(process.env.DSH_PORT || 3080);
 const DSH_LOG = '/tmp/dsh-web-' + DSH_PORT + '.log';
@@ -17,11 +18,22 @@ const NODE = process.execPath;
 //   DSH_START_CMD="node --import tsx/esm apps/cli/src/bin.ts web --port 3080"
 const DSH_START = process.env.DSH_START_CMD || (NODE + ' apps/cli/lib/bin.js web --port ' + DSH_PORT);
 
+// ---- 版本检查 / 更新 ----
+const REMOTE = process.env.DSH_REMOTE || 'origin';
+const UPDATE_REPO_URL = process.env.DSH_REPO_URL || 'https://github.com/deepseek-ai/deepseek-harness';
+const PACKAGE_REL = 'apps/cli/package.json';
+const FETCH_TIMEOUT = 2 * 60 * 1000;
+const BUILD_TIMEOUT = 10 * 60 * 1000;
+
 // ---- 转发状态 ----
 let seq = 0;
 const pending = [];
 const waiters = [];
 const results = new Map();
+
+// ---- 更新任务状态 ----
+let updating = false;
+let updateState = { state: 'idle', startedAt: null, finishedAt: null, step: '', message: '', error: null, warnings: [], detail: [] };
 
 function log(msg) {
   try { fs.appendFileSync(CTL_LOG, new Date().toISOString() + ' ' + msg + '\n'); } catch (e) {}
@@ -38,12 +50,112 @@ function respond(res, obj, status) {
   res.end(body);
 }
 
-function sh(cmd) {
+function sh(cmd, timeout) {
   return new Promise((resolve) => {
-    execFile('/bin/bash', ['-c', cmd], { timeout: 30000 }, (err, stdout, stderr) => {
+    execFile('/bin/bash', ['-c', cmd], { timeout: timeout || 30000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
       resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout: String(stdout), stderr: String(stderr) });
     });
   });
+}
+
+// shell 单引号转义
+function shq(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+function trim(s) {
+  return String(s || '').trim();
+}
+
+function tail(s, n) {
+  const t = trim(s);
+  if (!t) return '';
+  return t.length > (n || 4000) ? t.slice(-(n || 4000)) : t;
+}
+
+function git(args, timeout) {
+  return sh('git -C ' + shq(DSH_DIR) + ' ' + args, timeout);
+}
+
+function readJson(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
+}
+
+async function getLocalInfo() {
+  const [headR, fullR, branchR, diffR, cachedR] = await Promise.all([
+    git('rev-parse --short HEAD 2>/dev/null'),
+    git('rev-parse HEAD 2>/dev/null'),
+    git('symbolic-ref --short HEAD 2>/dev/null'),
+    git('diff --quiet 2>/dev/null'),
+    git('diff --cached --quiet 2>/dev/null'),
+  ]);
+  const info = {
+    dir: DSH_DIR,
+    commit: trim(fullR.stdout) || null,
+    shortCommit: trim(headR.stdout) || null,
+    branch: trim(branchR.stdout) || 'master',
+    dirty: diffR.code !== 0 || cachedR.code !== 0,
+  };
+  const pkg = readJson(path.join(DSH_DIR, PACKAGE_REL));
+  info.packageVersion = (pkg && pkg.version) || null;
+  return info;
+}
+
+async function getRemoteInfo(branch) {
+  const [shortR, fullR, fileR] = await Promise.all([
+    git('rev-parse --short ' + REMOTE + '/' + branch + ' 2>/dev/null'),
+    git('rev-parse ' + REMOTE + '/' + branch + ' 2>/dev/null'),
+    git('show ' + REMOTE + '/' + branch + ':' + PACKAGE_REL + ' 2>/dev/null'),
+  ]);
+  let pkg = null;
+  try { pkg = JSON.parse(fileR.stdout); } catch (e) {}
+  return {
+    commit: trim(fullR.stdout) || null,
+    shortCommit: trim(shortR.stdout) || null,
+    packageVersion: (pkg && pkg.version) || null,
+  };
+}
+
+async function getUpdateInfo(doFetch) {
+  if (doFetch) {
+    const f = await git('fetch ' + REMOTE + ' --prune 2>&1', FETCH_TIMEOUT);
+    if (f.code !== 0) throw new Error('git fetch 失败：' + tail(f.stderr || f.stdout, 2000));
+  }
+  const current = await getLocalInfo();
+  const branch = current.branch || 'master';
+  const latest = await getRemoteInfo(branch);
+  const behindR = await git('rev-list --count HEAD..' + REMOTE + '/' + branch + ' 2>/dev/null');
+  const aheadR = await git('rev-list --count ' + REMOTE + '/' + branch + '..HEAD 2>/dev/null');
+  const behind = parseInt(trim(behindR.stdout), 10) || 0;
+  const ahead = parseInt(trim(aheadR.stdout), 10) || 0;
+  return {
+    ok: true,
+    branch: branch,
+    current: current,
+    latest: latest,
+    hasUpdate: behind > 0,
+    behind: behind,
+    ahead: ahead,
+    compareUrl: UPDATE_REPO_URL + '/compare/' + encodeURIComponent(current.commit || 'HEAD') + '...' + encodeURIComponent(latest.commit || (REMOTE + '/' + branch)),
+  };
+}
+
+function setUpdate(partial) {
+  updateState = Object.assign({}, updateState, partial);
+  log('update: ' + JSON.stringify(partial));
+}
+
+function appendDetail(line) {
+  if (updateState.detail.length >= 300) updateState.detail.shift();
+  updateState.detail.push(line);
+}
+
+function pickPkgManager() {
+  const binDir = path.dirname(NODE);
+  const pnpm = path.join(binDir, 'pnpm');
+  const npm = path.join(binDir, 'npm');
+  if (fs.existsSync(pnpm)) return { install: pnpm + ' install', build: pnpm + ' run build' };
+  return { install: npm + ' install', build: npm + ' run build' };
 }
 
 async function currentPid() {
@@ -70,7 +182,7 @@ async function waitFree(secs) {
 
 async function startDsh() {
   log('startDsh');
-  await sh('cd ' + DSH_DIR + ' && nohup ' + DSH_START + ' > ' + DSH_LOG + ' 2>&1 &');
+  await sh('cd ' + shq(DSH_DIR) + ' && nohup ' + DSH_START + ' > ' + DSH_LOG + ' 2>&1 &');
   await sh('for ((i=0;i<15;i++)); do ' + LSOF + ' -ti tcp:' + DSH_PORT + ' -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 1; done');
   const pid = await currentPid();
   log('started pid=' + pid);
@@ -100,6 +212,91 @@ async function ctlRestart() {
   return { ok: true, running: !!np, pid: np || null, status: 'restarted', oldPid: pid || null };
 }
 
+// ---- 更新流程：拉取 + 保留本地修改 + 重装/重建 ----
+async function runUpdate() {
+  setUpdate({ state: 'running', startedAt: new Date().toISOString(), finishedAt: null, step: '准备检查仓库', message: '', error: null, warnings: [], detail: [] });
+  try {
+    const info = await getUpdateInfo(true);
+    if (!info.ok) throw new Error('无法获取更新信息');
+    if (!info.hasUpdate) {
+      setUpdate({ state: 'completed', step: '已是最新', message: '当前已是最新版本，无需更新', finishedAt: new Date().toISOString() });
+      return;
+    }
+
+    const wasRunning = !!(await currentPid());
+    if (wasRunning) {
+      setUpdate({ step: '停止当前 DSH 服务', message: '正在停止 DSH 以便安全更新' });
+      await ctlStop();
+      await waitFree(5);
+    }
+
+    // 只暂存“已跟踪文件”的本地修改；未跟踪的本地插件/构建产物原样保留。
+    let stashed = false;
+    const diffR = await git('diff --quiet 2>/dev/null');
+    const cachedR = await git('diff --cached --quiet 2>/dev/null');
+    if (diffR.code !== 0 || cachedR.code !== 0) {
+      setUpdate({ step: '暂存本地修改', message: '更新前暂存本地已跟踪修改，完成后自动恢复' });
+      const stashName = 'dsh-update-auto-' + Date.now();
+      const sr = await git('stash push -m ' + shq(stashName) + ' --quiet', 60000);
+      if (sr.code !== 0) throw new Error('暂存本地修改失败（未执行更新，原文件未动）：' + tail(sr.stderr || sr.stdout, 2000));
+      stashed = true;
+      appendDetail('stash: ' + stashName);
+    }
+
+    setUpdate({ step: '拉取远端更新', message: '正在从 ' + REMOTE + '/' + info.branch + ' 拉取' });
+    const mr = await git('merge --ff-only ' + REMOTE + '/' + info.branch + ' 2>&1', FETCH_TIMEOUT);
+    if (mr.code !== 0) {
+      if (stashed) {
+        setUpdate({ step: '拉取失败，恢复本地修改', message: '更新失败，正在恢复本地修改' });
+        await git('stash pop 2>&1', 60000);
+      }
+      throw new Error('拉取更新失败（本地修改已保留）：' + tail(mr.stderr || mr.stdout, 2000));
+    }
+    appendDetail('merge ok');
+
+    if (stashed) {
+      setUpdate({ step: '恢复本地修改', message: '正在恢复更新前暂存的本地修改' });
+      const pr = await git('stash pop 2>&1', 60000);
+      if (pr.code !== 0) {
+        updateState.warnings.push('拉取成功，但自动恢复本地修改时出现冲突，本地修改已保留在工作区，请手动处理：git stash list');
+        appendDetail('stash pop warning: ' + tail(pr.stderr || pr.stdout, 2000));
+        throw new Error('拉取完成，但恢复本地修改时出现冲突（本地修改已保留，未覆盖）；请手动解决冲突后重新构建。');
+      }
+    }
+
+    const pkgm = pickPkgManager();
+    setUpdate({ step: '安装依赖', message: '正在安装/更新 DSH 依赖' });
+    const ir = await sh('cd ' + shq(DSH_DIR) + ' && ' + pkgm.install + ' 2>&1', BUILD_TIMEOUT);
+    if (ir.code !== 0) throw new Error('依赖安装失败：' + tail(ir.stderr || ir.stdout, 3000));
+
+    setUpdate({ step: '重新构建 DSH', message: '正在重新构建（可能需要几分钟）' });
+    const br = await sh('cd ' + shq(DSH_DIR) + ' && ' + pkgm.build + ' 2>&1', BUILD_TIMEOUT);
+    if (br.code !== 0) throw new Error('构建失败：' + tail(br.stderr || br.stdout, 3000));
+
+    if (wasRunning) {
+      setUpdate({ step: '重新启动 DSH', message: '正在重新启动 DSH 服务' });
+      await ctlStart();
+    }
+
+    setUpdate({
+      state: 'completed',
+      step: '完成',
+      message: 'DSH 已更新并重新构建，本地插件/设置已保留',
+      finishedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    setUpdate({
+      state: 'failed',
+      step: '失败',
+      error: String((e && e.message) || e),
+      message: '更新失败，本地文件未被覆盖',
+      finishedAt: new Date().toISOString(),
+    });
+  } finally {
+    updating = false;
+  }
+}
+
 const server = http.createServer(function (req, res) {
   // ---- 生命周期控制端点 ----
   if (req.method === 'GET' && req.url === '/status') {
@@ -118,6 +315,28 @@ const server = http.createServer(function (req, res) {
     ctlRestart().then((r) => respond(res, r), (e) => respond(res, { ok: false, error: String((e && e.message) || e) }, 500));
     return;
   }
+
+  // ---- 版本检查 / 更新端点 ----
+  if (req.method === 'GET' && req.url === '/version') {
+    getLocalInfo().then((r) => respond(res, { ok: true, ...r }), (e) => respond(res, { ok: false, error: String((e && e.message) || e) }, 500));
+    return;
+  }
+  if (req.method === 'GET' && req.url === '/update-check') {
+    getUpdateInfo(true).then((r) => respond(res, r), (e) => respond(res, { ok: false, error: String((e && e.message) || e) }, 500));
+    return;
+  }
+  if (req.method === 'GET' && req.url === '/update-status') {
+    respond(res, { ok: true, updating: updating, ...updateState });
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/update') {
+    if (updating) { respond(res, { ok: false, error: '已有更新任务正在执行', state: updateState.state }); return; }
+    updating = true;
+    runUpdate();
+    respond(res, { ok: true, started: true, state: 'running' });
+    return;
+  }
+
   if (req.method === 'OPTIONS') { respond(res, { ok: true }); return; }
 
   // ---- 转发端点 ----
