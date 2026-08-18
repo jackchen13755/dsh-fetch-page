@@ -278,3 +278,66 @@ chrome.contextMenus.onClicked.addListener(async (info) => {
     updateIcon();
   }
 });
+
+// ── Figma WS 静默捕获（Kiwi 帧 → ~/Downloads/figma_ws）──────────────────
+
+const FIGMA_WS_PREFIX = 'figma_ws';
+
+function b64ToDataUrl(b64) { return `data:application/octet-stream;base64,${b64}`; }
+function utf8ToB64(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  bytes.forEach((b) => { bin += String.fromCharCode(b); });
+  return btoa(bin);
+}
+
+async function saveFigmaCapture(payload) {
+  const ts = payload.ts || Date.now();
+  const manifest = {
+    ts,
+    url: payload.url || '',
+    title: payload.title || '',
+    schemaFile: payload.schema ? `frame_0000_recv_${payload.schema.size}b.bin` : null,
+    schemaSize: payload.schema ? payload.schema.size : 0,
+    dataFile: `frame_0001_recv_${payload.data.size}b.bin`,
+    dataSize: payload.data.size,
+  };
+  const tasks = [];
+  if (payload.schema) {
+    tasks.push(chrome.downloads.download({
+      url: b64ToDataUrl(payload.schema.b64),
+      filename: `${FIGMA_WS_PREFIX}/${manifest.schemaFile}`,
+      saveAs: false,
+    }));
+  }
+  tasks.push(chrome.downloads.download({
+    url: b64ToDataUrl(payload.data.b64),
+    filename: `${FIGMA_WS_PREFIX}/${manifest.dataFile}`,
+    saveAs: false,
+  }));
+  tasks.push(chrome.downloads.download({
+    url: `data:application/json;base64,${utf8ToB64(JSON.stringify(manifest, null, 2))}`,
+    filename: `${FIGMA_WS_PREFIX}/last_capture.json`,
+    saveAs: false,
+  }));
+  const results = await Promise.allSettled(tasks);
+  const failed = results.filter((r) => r.status === 'rejected');
+  if (failed.length) {
+    throw new Error(`保存失败 ${failed.length}/${results.length}: ${failed[0].reason?.message || failed[0].reason}`);
+  }
+  try { await chrome.storage.local.set({ lastFigmaCapture: manifest }); } catch (_) {}
+  return manifest;
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.type === 'figma-ws-capture' && msg.payload && msg.payload.data) {
+    saveFigmaCapture(msg.payload)
+      .then(() => { flashBadge(true); sendResponse({ ok: true }); })
+      .catch((e) => {
+        flashBadge(false);
+        sendResponse({ ok: false, error: String(e && e.message ? e.message : e) });
+      });
+    return true; // 异步响应
+  }
+  return false;
+});

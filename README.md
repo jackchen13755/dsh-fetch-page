@@ -141,6 +141,27 @@ fetch_page url=https://example.com/private/page
 
 返回：HTTP 状态码、响应头、正文（HTML 自动提取为纯文本）。
 
+### Figma WS 静默捕获（零 REST API）
+
+扩展 v1.4.0 起，打开/刷新任意 `figma.com/design|file|proto` 页面时，会在后台静默捕获
+编辑器 WebSocket 的 Kiwi 二进制帧（`fig-wire` schema 帧 + 最大数据帧），并写入
+`~/Downloads/figma_ws/`：
+
+- `frame_0000_recv_<size>b.bin`（schema）
+- `frame_0001_recv_<size>b.bin`（数据）
+- `last_capture.json`（清单：时间 / URL / 帧文件）
+
+捕获不控制浏览器、不调用 Figma REST API。消费端可用
+[dsh-figma-reader](https://github.com/jackchen13755/dsh-figma-reader) 仓库里的
+`scripts/read-figma-ws.mjs` 解码成节点报告：
+
+```bash
+node scripts/read-figma-ws.mjs Zh9LpkjKgNrwuBITsD5d6g 8049:4704
+```
+
+实现：`extension/figma-ws-content.js` 注入 `extension/figma-ws-hook.js`（MAIN world 包装
+WebSocket），`extension/background.js` 收到帧后经 `chrome.downloads` 保存。
+
 ## 说明
 
 - 扩展后台通过 `chrome.alarms` 兜底恢复轮询；守护进程长轮询 25s，转发请求超时 30s。
