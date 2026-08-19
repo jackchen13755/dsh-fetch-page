@@ -91,7 +91,7 @@ function notify(title, message, ok) {
   try {
     chrome.notifications.create({
       type: 'basic',
-      iconUrl: chrome.runtime.getURL(ok === false ? 'icon-stopped.png' : 'icon-running.png'),
+      iconUrl: chrome.runtime.getURL(ok === false ? 'icon-stopped.png' : 'icon-running-blue.png'),
       title: title,
       message: message,
     });
@@ -102,7 +102,7 @@ function notify(title, message, ok) {
 async function updateIcon() {
   try {
     const s = await ctl('status');
-    const path = (s.ok && s.running) ? 'icon-running.png' : 'icon-stopped.png';
+    const path = (s.ok && s.running) ? 'icon-running-blue.png' : 'icon-stopped.png';
     chrome.action.setIcon({ path: { 128: path } });
   } catch (e) {}
 }
@@ -222,7 +222,7 @@ async function checkForUpdates(manual) {
       if (data.notifiedUpdateKey === key) return;
       chrome.notifications.create(UPDATE_NOTIFICATION_ID, {
         type: 'basic',
-        iconUrl: chrome.runtime.getURL('icon-running.png'),
+        iconUrl: chrome.runtime.getURL('icon-running-blue.png'),
         title: 'DSH 有新版本',
         message: '当前 ' + currentLabel + ' → 最新 ' + latestLabel +
           '（落后 ' + (info.behind || '?') + ' 个提交）\n点击“下载并重建”，本地插件/设置不会被覆盖。',
@@ -331,7 +331,28 @@ function utf8ToB64(str) {
   return btoa(bin);
 }
 
-async function saveFigmaCapture(payload) {
+const STORE = chrome.storage.session || chrome.storage.local;
+
+/** 捕获到帧：只存内存/会话存储 + 徽标提示，不自动下载。 */
+async function storeFigmaCapture(payload) {
+  await STORE.set({ figmaWsPending: payload });
+  try { await chrome.action.setBadgeBackgroundColor({ color: '#1a73e8' }); } catch (_) {}
+  try { await chrome.action.setBadgeText({ text: '1' }); } catch (_) {}
+  return { stored: true };
+}
+
+async function getPendingFigmaCapture() {
+  const s = await STORE.get('figmaWsPending');
+  return s.figmaWsPending || null;
+}
+
+async function clearPendingFigmaCapture() {
+  await STORE.remove('figmaWsPending');
+  try { await chrome.action.setBadgeText({ text: '' }); } catch (_) {}
+}
+
+/** 点击下载按钮时才真正写入 ~/Downloads/figma_ws/。 */
+async function downloadFigmaCapture(payload) {
   const ts = payload.ts || Date.now();
   const manifest = {
     ts,
@@ -348,17 +369,20 @@ async function saveFigmaCapture(payload) {
       url: b64ToDataUrl(payload.schema.b64),
       filename: `${FIGMA_WS_PREFIX}/${manifest.schemaFile}`,
       saveAs: false,
+      conflictAction: 'overwrite',
     }));
   }
   tasks.push(chrome.downloads.download({
     url: b64ToDataUrl(payload.data.b64),
     filename: `${FIGMA_WS_PREFIX}/${manifest.dataFile}`,
     saveAs: false,
+    conflictAction: 'overwrite',
   }));
   tasks.push(chrome.downloads.download({
     url: `data:application/json;base64,${utf8ToB64(JSON.stringify(manifest, null, 2))}`,
     filename: `${FIGMA_WS_PREFIX}/last_capture.json`,
     saveAs: false,
+    conflictAction: 'overwrite',
   }));
   const results = await Promise.allSettled(tasks);
   const failed = results.filter((r) => r.status === 'rejected');
@@ -371,8 +395,20 @@ async function saveFigmaCapture(payload) {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === 'figma-ws-capture' && msg.payload && msg.payload.data) {
-    saveFigmaCapture(msg.payload)
-      .then(() => { flashBadge(true); sendResponse({ ok: true }); })
+    storeFigmaCapture(msg.payload)
+      .then(() => sendResponse({ ok: true, stored: true }))
+      .catch((e) => sendResponse({ ok: false, error: String(e && e.message ? e.message : e) }));
+    return true; // 异步响应
+  }
+  if (msg && msg.type === 'figma-ws-download') {
+    getPendingFigmaCapture()
+      .then(async (payload) => {
+        if (!payload) throw new Error('暂无待下载的 Figma 帧（先打开 Figma 页面等待捕获）');
+        const manifest = await downloadFigmaCapture(payload);
+        await clearPendingFigmaCapture();
+        flashBadge(true);
+        sendResponse({ ok: true, manifest });
+      })
       .catch((e) => {
         flashBadge(false);
         sendResponse({ ok: false, error: String(e && e.message ? e.message : e) });

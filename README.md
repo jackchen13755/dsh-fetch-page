@@ -144,8 +144,9 @@ fetch_page url=https://example.com/private/page
 ### Figma WS 静默捕获（零 REST API）
 
 扩展 v1.4.0 起，打开/刷新任意 `figma.com/design|file|proto` 页面时，会在后台静默捕获
-编辑器 WebSocket 的 Kiwi 二进制帧（`fig-wire` schema 帧 + 最大数据帧），并写入
-`~/Downloads/figma_ws/`：
+编辑器 WebSocket 的 Kiwi 二进制帧（`fig-wire` schema 帧 + 最大数据帧），**只暂存内存**，
+不自动下载；页面右上角出现「⬇ 下载 Figma 帧」按钮，**点击后**才写入
+`~/Downloads/figma_ws/`（v1.6.0 起同名文件自动覆盖）：
 
 - `frame_0000_recv_<size>b.bin`（schema）
 - `frame_0001_recv_<size>b.bin`（数据）
@@ -160,7 +161,8 @@ node scripts/read-figma-ws.mjs Zh9LpkjKgNrwuBITsD5d6g 8049:4704
 ```
 
 实现：`extension/figma-ws-content.js` 注入 `extension/figma-ws-hook.js`（MAIN world 包装
-WebSocket），`extension/background.js` 收到帧后经 `chrome.downloads` 保存。
+WebSocket），捕获完成后注入浮层下载按钮；`extension/background.js` 暂存帧，
+收到 `figma-ws-download` 消息后经 `chrome.downloads`（`conflictAction: 'overwrite'`）保存。
 
 ## 说明
 
