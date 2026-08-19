@@ -50,7 +50,8 @@
         state.schema = { size: data.size, b64, url, ts: Date.now() };
         state.sent = false;
       }
-    } else if (!state.data || data.size > state.data.size) {
+    } else if (data.size >= 1024 && (!state.data || data.size > state.data.size)) {
+      // 忽略 <1KB 的小帧（JOIN_START 等），只认真正的场景图数据帧
       state.data = { size: data.size, b64, url, ts: Date.now() };
       state.sent = false;
     }
