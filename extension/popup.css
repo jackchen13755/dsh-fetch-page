@@ -169,6 +169,46 @@ body {
   background: transparent;
 }
 
+.version-wrap {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  margin-bottom: 8px;
+}
+
+.version-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+
+.version-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.version-status {
+  min-height: 16px;
+  margin: 4px 0 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.version-status.ok { color: var(--ok); }
+.version-status.err { color: var(--err); }
+.version-status.busy { color: var(--busy); }
+.version-status.has-update { color: var(--busy); }
+
+.version-actions {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr;
+  gap: 8px;
+}
+
 .open-row {
   display: grid;
   grid-template-columns: 1fr 1fr;

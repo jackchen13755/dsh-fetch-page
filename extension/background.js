@@ -24,6 +24,118 @@ async function forwardFetch(req) {
   }
 }
 
+// ── SPA 渲染抓取（真实标签页执行 JS，再注入 Readability 提取）──────────────
+
+function looksLikeSpaShell(html, contentType) {
+  if (!html) return false;
+  const ct = String(contentType || '').toLowerCase();
+  // 非 HTML 内容（JSON/JS/XML/媒体/纯文本）不升级渲染
+  if (/(json|javascript|xml|image|font|audio|video|text\/plain)/.test(ct)) return false;
+  // 没有 HTML 骨架或没有 script 的响应，不当作 SPA 空壳
+  if (!/<(html|body|div|script)\b/i.test(html)) return false;
+  if (!/<script\b/i.test(html)) return false;
+  const stripped = String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return stripped.length < 300;
+}
+
+async function forwardRender(req) {
+  const opts = {
+    timeout: Math.min(Math.max(Number(req.timeout) || 45, 5), 120),
+    waitForSelector: String(req.wait_for_selector || ''),
+    targetSelector: String(req.target_selector || ''),
+    scroll: Math.min(Math.max(Number(req.scroll) || 0, 0), 20),
+    format: String(req.format || 'markdown'),
+  };
+  let tab = null;
+  try {
+    tab = await chrome.tabs.create({ url: req.url, active: false });
+    const tabId = tab && tab.id;
+    if (tabId == null) return { id: req.id, ok: false, error: 'render: 无法创建渲染标签页' };
+
+    // 等标签页 load 完成
+    const deadline = Date.now() + opts.timeout * 1000;
+    let loaded = false;
+    while (Date.now() < deadline) {
+      let t = null;
+      try { t = await chrome.tabs.get(tabId); } catch (e) { break; }
+      if (t && t.status === 'complete') { loaded = true; break; }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    if (!loaded) return { id: req.id, ok: false, error: 'render: 页面加载超时（' + opts.timeout + 's）' };
+
+    // 注入提取脚本（Readability + Turndown + 提取器，同一 isolated world）
+    await chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      files: ['reader/Readability.js', 'reader/turndown.js', 'reader/content-extract.js'],
+    });
+
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      func: function (o) {
+        return window.__dshExtractPage ? window.__dshExtractPage(o) : Promise.resolve({ error: 'reader 脚本未安装' });
+      },
+      args: [opts],
+    });
+    const ex = results && results[0] && results[0].result;
+    if (!ex) return { id: req.id, ok: false, error: 'render: 提取脚本无返回' };
+    if (ex.error) return { id: req.id, ok: false, error: ex.error };
+    if (!ex.text && !ex.markdown && !ex.html) {
+      return { id: req.id, ok: false, error: 'render: 页面无可提取文本（可能是空白页或反爬验证页）' };
+    }
+
+    let body = '';
+    if (opts.format === 'html') body = ex.html || '';
+    else if (opts.format === 'text') body = ex.text || ex.markdown || '';
+    else body = ex.markdown || ex.text || '';
+
+    return {
+      id: req.id,
+      ok: true,
+      status: 200,
+      statusText: 'rendered',
+      headers: { 'content-type': opts.format === 'html' ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8' },
+      body: body,
+      extra: {
+        rendered: true,
+        mode: 'render',
+        title: ex.title || '',
+        byline: ex.byline || '',
+        excerpt: ex.excerpt || '',
+        text: ex.text || '',
+        markdown: opts.format === 'markdown' ? body : (ex.markdown || ''),
+        url: ex.finalUrl || ex.url || req.url,
+        htmlLength: ex.html ? ex.html.length : (ex.text ? ex.text.length : 0),
+      },
+    };
+  } catch (e) {
+    return { id: req.id, ok: false, error: 'render: ' + String((e && e.message) || e) };
+  } finally {
+    if (tab && tab.id != null) {
+      try { await chrome.tabs.remove(tab.id); } catch (e) {}
+    }
+  }
+}
+
+async function handleRequest(req) {
+  const mode = String(req.mode || 'auto');
+  const method = String(req.method || 'GET').toUpperCase();
+  // POST 等无法用标签页渲染（浏览器导航只支持 GET），退回纯 fetch
+  if (method !== 'GET') return forwardFetch(req);
+  if (mode === 'render') return forwardRender(req);
+  if (mode === 'fetch') return forwardFetch(req);
+  // auto：先轻量 fetch，命中 SPA 空壳再升级渲染
+  const r = await forwardFetch(req);
+  if (r && r.ok && looksLikeSpaShell(r.body, r.headers && r.headers['content-type'])) return forwardRender(req);
+  return r;
+}
+
 async function pollOnce() {
   let resp;
   try {
@@ -32,7 +144,7 @@ async function pollOnce() {
   let req = null;
   try { req = await resp.json(); } catch (e) { return; }
   if (!req || !req.id) return;
-  const result = await forwardFetch(req);
+  const result = await handleRequest(req);
   try {
     await fetch(BASE + '/result', {
       method: 'POST',
@@ -145,7 +257,7 @@ chrome.action.onClicked.addListener(async () => {
 // ── Popup 消息（状态 / 生命周期 / 控制 / 日志）──────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg.type !== 'string') return false;
-  const types = ['getStatus', 'getLifecycle', 'start', 'stop', 'restart', 'openPage', 'getLogs'];
+  const types = ['getStatus', 'getLifecycle', 'start', 'stop', 'restart', 'openPage', 'getLogs', 'getVersionInfo', 'checkUpdate', 'checkUpdateSilent', 'startUpdate', 'getUpdateStatus'];
   if (!types.includes(msg.type)) return false;
   const run = async () => {
     switch (msg.type) {
@@ -156,6 +268,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case 'restart': { const r = await ctl('restart'); updateIcon(); return r; }
       case 'openPage': openPage(); return { ok: true };
       case 'getLogs': return getLogs(msg.name, msg.lines);
+      case 'getVersionInfo': return versionInfo || { ok: false, error: '尚未检查更新' };
+      case 'checkUpdate': return checkForUpdates(true);
+      case 'checkUpdateSilent': return checkForUpdates(false);
+      case 'startUpdate': return startUpdate();
+      case 'getUpdateStatus': return getUpdateStatus();
     }
   };
   run().then(sendResponse).catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
@@ -170,26 +287,12 @@ function formatVersion(v) {
   return v.packageVersion || v.shortCommit || v.commit || '未知';
 }
 
-// 重建右键菜单：第一项固定展示当前版本；有更新时“下载并重建”才可点。
-function rebuildContextMenus(info) {
-  const hasUpdate = !!(info && info.hasUpdate);
-  const currentLabel = formatVersion(info && info.current);
-  const latestLabel = formatVersion(info && info.latest);
+// 版本检查结果缓存（popup 经 getVersionInfo 读取）。
+let versionInfo = null;
+
+// 重建右键菜单：版本检查/更新已迁移到 popup，这里只保留重启/停止。
+function rebuildContextMenus() {
   chrome.contextMenus.removeAll(() => {
-    chrome.contextMenus.create({
-      id: 'dsh-version',
-      title: '当前 DSH 版本: ' + currentLabel,
-      contexts: ['action'],
-      enabled: false,
-    });
-    chrome.contextMenus.create({ id: 'dsh-check-update', title: '检查 DSH 更新', contexts: ['action'] });
-    chrome.contextMenus.create({
-      id: 'dsh-update',
-      title: hasUpdate ? '下载并重建 DSH (' + latestLabel + ')' : '下载并重建 DSH',
-      contexts: ['action'],
-      enabled: hasUpdate,
-    });
-    chrome.contextMenus.create({ id: 'dsh-sep', type: 'separator', contexts: ['action'] });
     chrome.contextMenus.create({ id: 'dsh-restart', title: '重启 DSH', contexts: ['action'] });
     chrome.contextMenus.create({ id: 'dsh-stop', title: '停止 DSH', contexts: ['action'] });
   });
@@ -201,20 +304,24 @@ async function checkForUpdates(manual) {
     const r = await fetch(BASE + '/update-check', { signal: AbortSignal.timeout(120000) });
     info = await r.json();
   } catch (e) {
-    if (manual) notify('检查失败', '无法连接本地守护进程', false);
-    return;
+    const failed = { ok: false, error: '无法连接本地守护进程' };
+    versionInfo = failed;
+    if (manual) notify('检查失败', failed.error, false);
+    return failed;
   }
   if (!info || !info.ok) {
-    if (manual) notify('检查失败', (info && info.error) || '未知错误', false);
-    return;
+    const failed = { ok: false, error: (info && info.error) || '未知错误' };
+    versionInfo = failed;
+    if (manual) notify('检查失败', failed.error, false);
+    return failed;
   }
 
+  versionInfo = info;
   const currentLabel = formatVersion(info.current);
   const latestLabel = formatVersion(info.latest);
   chrome.action.setTitle({
     title: 'DSH 控制\n当前版本: ' + currentLabel + (info.hasUpdate ? '\n有新版本: ' + latestLabel : ''),
   });
-  rebuildContextMenus(info);
 
   if (info.hasUpdate) {
     const key = (info.latest && (info.latest.commit || info.latest.packageVersion)) || 'update';
@@ -243,6 +350,16 @@ async function checkForUpdates(manual) {
   if (manual) {
     notify('版本检查完成', info.hasUpdate ? '发现新版本 ' + latestLabel : '当前已是最新版本 ' + currentLabel, true);
   }
+  return info;
+}
+
+async function getUpdateStatus() {
+  try {
+    const r = await fetch(BASE + '/update-status', { signal: AbortSignal.timeout(10000) });
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
 }
 
 async function startUpdate() {
@@ -250,16 +367,19 @@ async function startUpdate() {
   try {
     r = await (await fetch(BASE + '/update', { method: 'POST', signal: AbortSignal.timeout(10000) })).json();
   } catch (e) {
-    notify('更新失败', '无法连接本地守护进程', false);
-    return;
+    const failed = { ok: false, error: '无法连接本地守护进程' };
+    notify('更新失败', failed.error, false);
+    return failed;
   }
   if (!r || !r.ok || !r.started) {
-    notify('更新失败', (r && r.error) || '未知错误', false);
-    return;
+    const failed = { ok: false, error: (r && r.error) || '未知错误' };
+    notify('更新失败', failed.error, false);
+    return failed;
   }
   notify('开始更新', '正在拉取最新 DSH 并重新构建，本地插件/设置会保留。', true);
   chrome.alarms.create(UPDATE_POLL_ALARM, { periodInMinutes: POLL_INTERVAL_MINUTES });
   pollUpdateStatus();
+  return { ok: true, started: true };
 }
 
 async function pollUpdateStatus() {
@@ -278,8 +398,8 @@ async function pollUpdateStatus() {
   updateIcon();
 }
 
-// 首次加载先建菜单（版本未知），随后立即检查一次版本。
-rebuildContextMenus(null);
+// 首次加载先建菜单（重启/停止），随后立即检查一次版本供 popup 显示。
+rebuildContextMenus();
 checkForUpdates(false);
 
 // 通知按钮：点击“下载并重建”触发更新；“稍后”只关闭。
@@ -294,13 +414,9 @@ chrome.notifications.onClicked.addListener((id) => {
   startUpdate();
 });
 
-// 右键菜单：版本检查 / 更新 / 重启 / 停止
+// 右键菜单：重启 / 停止（版本检查与更新已迁移到 popup）
 chrome.contextMenus.onClicked.addListener(async (info) => {
-  if (info.menuItemId === 'dsh-check-update') {
-    checkForUpdates(true);
-  } else if (info.menuItemId === 'dsh-update') {
-    startUpdate();
-  } else if (info.menuItemId === 'dsh-restart') {
+  if (info.menuItemId === 'dsh-restart') {
     const r = await ctl('restart');
     if (r.ok) {
       notify('重启成功', 'DSH 已重启' + (r.pid ? ' · PID ' + r.pid : ''));

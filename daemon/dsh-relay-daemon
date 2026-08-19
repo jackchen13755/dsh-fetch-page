@@ -8,15 +8,16 @@ const path = require('path');
 
 const PORT = Number(process.env.DSH_DAEMON_PORT || 9317);
 // 本机 DSH checkout 路径。也可用环境变量 DSH_CHECKOUT 覆盖。
-const DSH_DIR = process.env.DSH_CHECKOUT || path.join(os.homedir(), 'deepseek-harness');
+const DSH_DIR = process.env.DSH_CHECKOUT || path.join(os.homedir(), 'Desktop', 'work', 'deepseek-harness');
 const DSH_PORT = Number(process.env.DSH_PORT || 3080);
 const DSH_LOG = '/tmp/dsh-web-' + DSH_PORT + '.log';
 const CTL_LOG = '/tmp/dsh-relay-daemon.log';
 const LSOF = '/usr/sbin/lsof';
 const NODE = process.execPath;
-// DSH 启动命令。默认用编译产物（生产模式）；开发模式可整条覆盖，例如：
-//   DSH_START_CMD="node --import tsx/esm apps/cli/src/bin.ts web --port 3080"
-const DSH_START = process.env.DSH_START_CMD || (NODE + ' apps/cli/lib/bin.js web --port ' + DSH_PORT);
+// DSH 启动命令。默认走 tsx 源码启动（与 dsh-web 启动器一致）；生产模式可整条覆盖：
+//   DSH_START_CMD="node /abs/path/to/deepseek-harness/apps/cli/lib/bin.js web --port 3080"
+const DSH_START = process.env.DSH_START_CMD
+  || (NODE + ' --import tsx/esm ' + shq(path.join(DSH_DIR, 'apps/cli/src/bin.ts')) + ' web --port ' + DSH_PORT);
 
 // ---- 版本检查 / 更新 ----
 const REMOTE = process.env.DSH_REMOTE || 'origin';
@@ -207,7 +208,7 @@ async function waitFree(secs) {
 async function startDsh() {
   log('startDsh');
   setLifecycle({ state: 'starting', startedAt: new Date().toISOString(), finishedAt: null, step: '启动进程', message: '正在启动 DSH 进程', error: null, log: '' });
-  await sh('cd ' + shq(DSH_DIR) + '; nohup ' + DSH_START + ' > ' + DSH_LOG + ' 2>&1 < /dev/null &');
+  await sh('cd ' + shq(DSH_DIR) + ' || { echo "cd failed: ' + DSH_DIR + '"; exit 1; }; nohup ' + DSH_START + ' > ' + DSH_LOG + ' 2>&1 < /dev/null &');
   setLifecycle({ state: 'starting', step: '等待端口', message: '正在等待端口 ' + DSH_PORT + ' 就绪' });
   await sh('for ((i=0;i<75;i++)); do ' + LSOF + ' -ti tcp:' + DSH_PORT + ' -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.2; done');
   const pid = await currentPid();
@@ -439,17 +440,32 @@ const server = http.createServer(async function (req, res) {
       try { fwd = JSON.parse(data); } catch (e) {}
       if (!fwd || !fwd.url) { respond(res, { error: 'missing url' }, 400); return; }
       const id = 'f' + (++seq) + '-' + Date.now();
-      const req2 = { id: id, url: fwd.url, method: fwd.method || 'GET', headers: fwd.headers || {}, body: fwd.body || null, at: Date.now() };
+      const method = String(fwd.method || 'GET').toUpperCase();
+      const req2 = {
+        id: id,
+        url: fwd.url,
+        method: method,
+        headers: fwd.headers || {},
+        body: fwd.body || null,
+        mode: fwd.mode || 'auto',
+        wait_for_selector: fwd.wait_for_selector || '',
+        target_selector: fwd.target_selector || '',
+        timeout: Math.min(Math.max(Number(fwd.timeout) || 30, 5), 120),
+        scroll: Math.min(Math.max(Number(fwd.scroll) || 0, 0), 20),
+        format: fwd.format || 'markdown',
+        at: Date.now(),
+      };
+      const timeoutSec = Math.min((Number(fwd.timeout) || 30) + 10, 150);
       const timer = setTimeout(function () {
         results.delete(id);
-        respond(res, { error: '转发超时：浏览器扩展未连接或未响应' });
-      }, 30000);
+        respond(res, { error: '转发超时：浏览器扩展未连接或未响应（' + timeoutSec + 's）' });
+      }, timeoutSec * 1000);
       results.set(id, {
         timer: timer,
         resolve: function (msg) {
           clearTimeout(timer);
           results.delete(id);
-          respond(res, { status: msg.status, statusText: msg.statusText, headers: msg.headers, body: msg.body });
+          respond(res, { status: msg.status, statusText: msg.statusText, headers: msg.headers, body: msg.body, ...(msg.extra && typeof msg.extra === 'object' ? msg.extra : {}) });
         },
       });
       if (waiters.length > 0) { const w = waiters.shift(); clearTimeout(w.timer); respond(w.res, req2); }

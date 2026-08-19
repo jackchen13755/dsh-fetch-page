@@ -138,8 +138,38 @@ fetch_page url=https://example.com/private/page
 - `method`：HTTP 方法（GET/POST/PUT/DELETE/PATCH，默认 GET）
 - `headers`：额外请求头（扩展自动附带浏览器 Cookie）
 - `body`：请求体（字符串）
+- `mode`：`auto`（默认）/ `fetch` / `render`
+  - `fetch`：纯 HTTP 转发，不执行 JS
+  - `render`：扩展打开真实标签页执行 JS，等 SPA 渲染稳定后用 Readability + Turndown 提取正文
+  - `auto`：先 `fetch`，发现是 SPA 空壳（去脚本后正文 < 300 字符）自动升级为 `render`
+- `wait_for_selector`：渲染模式下等待该 CSS 选择器出现后再提取（如 `.content`、`#root table`）
+- `target_selector`：只提取该 CSS 选择器对应区域
+- `timeout`：渲染等待/请求超时秒数（默认 45，最大 120）
+- `scroll`：提取前滚动到底部的次数（无限滚动/懒加载页面，默认 0，最大 20）
+- `format`：渲染输出格式 `markdown`（默认）/ `text` / `html`
 
-返回：HTTP 状态码、响应头、正文（HTML 自动提取为纯文本）。
+示例（SPA 渲染抓取）：
+
+```
+fetch_page url=https://app.example.com/dashboard mode=render wait_for_selector=.dashboard-cards timeout=30
+```
+
+返回：HTTP 状态码、响应头、正文；渲染模式返回 Markdown 正文并附带 `title/text/url/rendered` 字段。
+
+### 验证开发结果
+
+`browser-plugin` 提供 `verify_page` 工具：打开真实 Chrome 页面，按 JSON 断言契约校验
+DOM/样式/文本，收集 console/network 错误，失败时自动截图留证（浏览器登录态保留）：
+
+```
+verify_page url=http://localhost:3000/orders \
+  wait_for_selector=.order-list \
+  assertions=[{"type":"selector_visible","selector":".btn-primary","expect":true},{"type":"text_contains","selector":".title","text":"订单"},{"type":"count","selector":".order-item","min":1}]
+```
+
+断言 `type` 支持：`selector_exists` / `selector_visible` / `text_contains` / `text_equals` /
+`count` / `attribute` / `style`。可选 `screenshot=true` 始终截图、`fail_on_console_errors=true`
+让 console error 也判定失败。
 
 ### Figma WS 静默捕获（零 REST API）
 

@@ -4,6 +4,9 @@
  * state) travels with the request while CORS is bypassed by the extension's
  * background fetch.
  *
+ * 新增 SPA 渲染模式：`mode: "render"` 时扩展会在真实标签页中执行 JS，
+ * 等待 SPA 渲染稳定后用 Readability + Turndown 提取正文（Markdown/Text/HTML）。
+ *
  * @module @deepseek-ai/dsh-tool-fetch-page
  */
 
@@ -55,17 +58,23 @@ function textBlock(text: string): { type: 'text'; text: string } {
   return { type: 'text', text }
 }
 
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof value === 'number' ? value : (typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(Math.max(Math.round(n), min), max)
+}
+
 export function apply(ctx: Context, config: Config = {}): void {
   const daemonUrl = config.daemonUrl ?? 'http://127.0.0.1:9317'
   const daemonPath = config.daemonPath ?? join(homedir(), 'dsh', 'dsh-relay-daemon')
   const workdir = config.workdir ?? homedir()
   const workspaceRoot = config.workspaceRoot ?? homedir()
 
-  function run(cmd: string, stdin?: string): Promise<ShellRunResult> {
+  function run(cmd: string, stdin?: string, timeoutMs = 45000): Promise<ShellRunResult> {
     return ctx.shell.run(ctx.shell.resolve({
       command: cmd,
       workdir,
-      timeoutMs: 45000,
+      timeoutMs,
       stdoutMaxBytes: 8388608,
       sandboxPolicy: { mode: 'danger-full-access', workspaceRoot },
       ...(stdin !== undefined ? { stdin } : {}),
@@ -78,12 +87,22 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   ctx.tools.register(defineTool({
     name: 'fetch_page',
-    description: '通过浏览器扩展用当前浏览器的 Cookie 转发 HTTP 请求，可访问登录态页面并绕过 CORS。扩展未连接时会超时。',
+    description:
+      '通过浏览器扩展抓取页面：默认用浏览器 Cookie 转发 HTTP 请求（绕过 CORS，可访问登录态页面）。' +
+      '单页应用（SPA）内容由 JS 渲染、纯 HTTP 拿不到时，用 mode:"render" 在真实标签页中执行 JS 并提取正文；' +
+      'mode:"auto" 会先轻量抓取、发现是 SPA 空壳时自动升级为渲染。' +
+      '渲染模式可配合 wait_for_selector（等某元素出现）、target_selector（只提取页内某区域）、scroll（无限滚动加载次数）、format（markdown/text/html）。',
     parameters: {
       url: { type: 'string', required: true, description: '目标 URL' },
-      method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'], description: 'HTTP 方法，默认 GET' },
-      headers: { type: 'object', additionalProperties: true, description: '额外请求头（扩展会自动携带 Cookie）' },
-      body: { type: 'string', description: '请求体（字符串）' },
+      method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'], description: 'HTTP 方法，默认 GET（渲染模式仅支持 GET）' },
+      headers: { type: 'object', additionalProperties: true, description: '额外请求头（扩展会自动携带浏览器 Cookie）' },
+      body: { type: 'string', description: '请求体（字符串，仅非 GET 生效）' },
+      mode: { type: 'string', enum: ['auto', 'fetch', 'render'], description: '抓取模式：auto=先轻量抓取、SPA 空壳自动升级渲染（默认）；fetch=纯 HTTP 不执行 JS；render=真实标签页执行 JS 后提取' },
+      wait_for_selector: { type: 'string', description: '渲染模式：等待该 CSS 选择器出现后再提取（如 .content、#root table）' },
+      target_selector: { type: 'string', description: '渲染模式：只提取该 CSS 选择器对应区域的内容' },
+      timeout: { type: 'number', description: '渲染等待/请求超时秒数，默认 45，最大 120' },
+      scroll: { type: 'number', description: '渲染模式：提取前滚动到底部的次数（无限滚动/懒加载页面用），默认 0，最大 20' },
+      format: { type: 'string', enum: ['markdown', 'text', 'html'], description: '渲染模式输出格式，默认 markdown' },
     },
     output: {
       schema: {
@@ -94,27 +113,49 @@ export function apply(ctx: Context, config: Config = {}): void {
           statusText: { type: 'string' },
           headers: { type: 'object', additionalProperties: true },
           body: { type: 'string' },
+          rendered: { type: 'boolean' },
+          title: { type: 'string' },
+          text: { type: 'string' },
+          markdown: { type: 'string' },
+          url: { type: 'string' },
           error: { type: 'string' },
         },
       },
       render(_args, value) {
         if (value.error !== undefined) return [textBlock(`转发失败: ${value.error}`)]
         const raw = typeof value.body === 'string' ? value.body : ''
-        const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(raw)
-        const title = titleMatch?.[1] !== undefined ? titleMatch[1].replace(/<[^>]+>/g, '').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').trim() : ''
-        const isHtml = /<(html|head|body|title|div|p|span|a|table|meta)[^>]*>/i.test(raw)
-        const text = isHtml ? htmlToText(raw) : raw
+        const rendered = value.rendered === true
+        const title = rendered
+          ? (typeof value.title === 'string' ? value.title : '')
+          : ((/<title[^>]*>([\s\S]*?)<\/title>/i.exec(raw)?.[1]) ?? '').replace(/<[^>]+>/g, '').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').trim()
+        const isHtml = rendered ? false : /<(html|head|body|title|div|p|span|a|table|meta)[^>]*>/i.test(raw)
+        const text = rendered ? raw : (isHtml ? htmlToText(raw) : raw)
         const head = text.slice(0, 12000)
         const more = text.length > 12000 ? `\n\n…(已截断，正文共 ${text.length} 字符)` : ''
-        const line1 = `HTTP ${value.status ?? '?'}${title !== '' ? ` · ${title}` : ''}\n\n`
+        const prefix = rendered ? `SPA 渲染抓取 · HTTP ${value.status ?? 200}` : `HTTP ${value.status ?? '?'}`
+        const line1 = `${prefix}${title !== '' ? ` · ${title}` : ''}\n\n`
         return [textBlock(line1 + head + more)]
       },
     },
     async execute(args, _exec) {
       try {
         await ensureDaemon()
-        const payload = JSON.stringify({ url: args.url, method: args.method ?? 'GET', headers: args.headers ?? {}, body: args.body ?? null })
-        const result = await run(`curl -s --max-time 35 -X POST ${daemonUrl}/forward -H "Content-Type: application/json" --data-binary @-`, payload)
+        const mode = typeof args.mode === 'string' ? args.mode : 'auto'
+        const timeout = clampInt(args.timeout, 45, 5, 120)
+        const payload = JSON.stringify({
+          url: args.url,
+          method: args.method ?? 'GET',
+          headers: args.headers ?? {},
+          body: args.body ?? null,
+          mode,
+          wait_for_selector: args.wait_for_selector ?? '',
+          target_selector: args.target_selector ?? '',
+          timeout,
+          scroll: clampInt(args.scroll, 0, 0, 20),
+          format: args.format ?? 'markdown',
+        })
+        const curlTimeout = timeout + 15
+        const result = await run(`curl -s --max-time ${curlTimeout} -X POST ${daemonUrl}/forward -H "Content-Type: application/json" --data-binary @-`, payload, (timeout + 30) * 1000)
         const out = result.stdout?.text ?? ''
         try {
           return JSON.parse(out)

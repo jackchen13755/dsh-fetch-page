@@ -16,6 +16,11 @@ function send(msg) {
   });
 }
 
+// 后台 service worker 未就绪/旧版本时，sendMessage 会报端口关闭
+function isPortClosed(err) {
+  return /port closed|Receiving end does not exist|message port/i.test(String(err || ''));
+}
+
 function setPill(text, cls) {
   const el = $('statusPill');
   el.textContent = text;
@@ -44,7 +49,9 @@ function setButtonsDisabled(disabled) {
 
 function applyLifecycle(life) {
   if (!life || !life.ok) return;
-  const state = life.state || (life.running ? 'running' : 'idle');
+  let state = life.state || (life.running ? 'running' : 'idle');
+  // 守护进程重启后 lifecycle.state 可能停留在 idle，但服务实际在跑：以 running 为准
+  if (state === 'idle' && life.running) state = 'running';
   // 操作进行中时，忽略还没开始更新的 idle 状态，避免进度条闪回“未运行”
   if (busy && state === 'idle') return;
   if (state === 'starting' || state === 'restarting' || state === 'stopping') {
@@ -60,8 +67,8 @@ function applyLifecycle(life) {
       'busy'
     );
   } else if (state === 'running') {
-    setProgress(100, 'done', life.message || 'DSH 运行中');
-    setStatus(life.message || ('DSH 正在运行' + (life.pid ? ' · PID ' + life.pid : '')), 'ok');
+    setProgress(100, 'done', 'DSH 运行中');
+    setStatus('DSH 正在运行' + (life.pid ? ' · PID ' + life.pid : ''), 'ok');
     setPill('运行中', 'ok');
   } else if (state === 'failed') {
     setProgress(0, 'fail', life.message || '操作失败');
@@ -249,15 +256,145 @@ async function doStop() {
   }
 }
 
+// ── 版本检查 / 更新（从右键菜单迁移到 popup）────────────────────────────
+
+let updateBusy = false;
+let updateAvailable = false;
+let updatePollTimer = null;
+
+function formatVersion(v) {
+  if (!v) return '—';
+  if (v.packageVersion && v.shortCommit) return v.packageVersion + ' (' + v.shortCommit + ')';
+  return v.packageVersion || v.shortCommit || v.commit || '—';
+}
+
+function setUpdateBusy(v) {
+  updateBusy = v;
+  $('btnCheckUpdate').disabled = v;
+  $('btnUpdate').disabled = v || !updateAvailable;
+}
+
+function renderVersion(info) {
+  if (!info || !info.ok) {
+    const err = (info && info.error) || '';
+    const msg = isPortClosed(err) ? '后台未响应，请先在 chrome://extensions 重新加载扩展' : err;
+    $('versionCurrent').textContent = '当前版本：' + (err ? '读取失败' : '—');
+    $('versionLatest').textContent = '最新版本：—';
+    $('updateStatus').textContent = msg || '';
+    $('updateStatus').className = 'version-status' + (err ? ' err' : '');
+    updateAvailable = false;
+    setUpdateBusy(updateBusy);
+    return;
+  }
+  updateAvailable = !!info.hasUpdate;
+  $('versionCurrent').textContent = '当前版本：' + formatVersion(info.current);
+  $('versionLatest').textContent = '最新版本：' + formatVersion(info.latest);
+  if (info.hasUpdate) {
+    $('updateStatus').textContent = '发现新版本（落后 ' + (info.behind || '?') + ' 个提交）';
+    $('updateStatus').className = 'version-status has-update';
+  } else {
+    $('updateStatus').textContent = '当前已是最新版本';
+    $('updateStatus').className = 'version-status ok';
+  }
+  setUpdateBusy(updateBusy);
+}
+
+async function loadVersionInfo() {
+  let info = await send({ type: 'getVersionInfo' });
+  // service worker 冷启动时可能未就绪，端口关闭则稍等重试一次
+  if (info && !info.ok && isPortClosed(info.error)) {
+    await new Promise((r) => setTimeout(r, 600));
+    info = await send({ type: 'getVersionInfo' });
+  }
+  renderVersion(info);
+}
+
+async function doCheckUpdate() {
+  if (updateBusy) return;
+  setUpdateBusy(true);
+  $('updateStatus').textContent = '正在检查更新…';
+  $('updateStatus').className = 'version-status busy';
+  const info = await send({ type: 'checkUpdate' });
+  setUpdateBusy(false);
+  if (info && !info.ok && isPortClosed(info.error)) {
+    $('updateStatus').textContent = '后台未响应，请先在 chrome://extensions 重新加载扩展';
+    $('updateStatus').className = 'version-status err';
+    updateAvailable = false;
+    setUpdateBusy(false);
+    return;
+  }
+  renderVersion(info);
+}
+
+async function pollUpdateStatus() {
+  stopUpdatePolling();
+  updatePollTimer = setInterval(async () => {
+    const s = await send({ type: 'getUpdateStatus' });
+    if (!s || !s.ok) {
+      stopUpdatePolling();
+      setUpdateBusy(false);
+      $('updateStatus').textContent = (s && s.error) || '读取更新状态失败';
+      $('updateStatus').className = 'version-status err';
+      return;
+    }
+    if (s.state === 'completed') {
+      stopUpdatePolling();
+      setUpdateBusy(false);
+      $('updateStatus').textContent = s.message || '更新完成';
+      $('updateStatus').className = 'version-status ok';
+      const info = await send({ type: 'getVersionInfo' });
+      renderVersion(info);
+    } else if (s.state === 'failed') {
+      stopUpdatePolling();
+      setUpdateBusy(false);
+      $('updateStatus').textContent = s.error || s.message || '更新失败';
+      $('updateStatus').className = 'version-status err';
+    } else {
+      $('updateStatus').textContent = s.message || s.step || '更新中…';
+      $('updateStatus').className = 'version-status busy';
+    }
+  }, 1000);
+}
+
+function stopUpdatePolling() {
+  if (updatePollTimer) {
+    clearInterval(updatePollTimer);
+    updatePollTimer = null;
+  }
+}
+
+async function doStartUpdate() {
+  if (updateBusy || !updateAvailable) return;
+  if (!window.confirm('将停止 DSH、拉取最新版本并重新构建（本地插件/设置保留）。确定继续？')) return;
+  setUpdateBusy(true);
+  $('updateStatus').textContent = '正在提交更新任务…';
+  $('updateStatus').className = 'version-status busy';
+  const r = await send({ type: 'startUpdate' });
+  if (r && r.ok) {
+    pollUpdateStatus();
+  } else {
+    setUpdateBusy(false);
+    const err = (r && r.error) || '更新启动失败';
+    $('updateStatus').textContent = isPortClosed(err) ? '后台未响应，请先在 chrome://extensions 重新加载扩展' : err;
+    $('updateStatus').className = 'version-status err';
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   $('btnStart').addEventListener('click', doStart);
   $('btnRestart').addEventListener('click', doRestart);
   $('btnStop').addEventListener('click', doStop);
   $('btnOpen').addEventListener('click', () => send({ type: 'openPage' }));
   $('btnToggleLog').addEventListener('click', toggleLog);
+  $('btnCheckUpdate').addEventListener('click', doCheckUpdate);
+  $('btnUpdate').addEventListener('click', doStartUpdate);
 
   refresh();
   startPolling(2000);
+  loadVersionInfo();
 });
 
-window.addEventListener('unload', stopPolling);
+window.addEventListener('unload', () => {
+  stopPolling();
+  stopUpdatePolling();
+});
