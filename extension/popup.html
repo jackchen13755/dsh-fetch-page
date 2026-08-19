@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="popup.css" />
+  <title>DSH 控制</title>
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="title">DSH 控制</div>
+      <span id="statusPill" class="pill">…</span>
+    </header>
+
+    <section class="status-line">
+      <span id="statusText">正在读取状态…</span>
+    </section>
+
+    <section class="progress-wrap">
+      <div id="progress" class="progress">
+        <div id="progressBar" class="progress-bar"></div>
+      </div>
+      <div id="progressLabel" class="progress-label">—</div>
+    </section>
+
+    <section class="actions">
+      <button id="btnStart" class="btn primary" type="button">开启服务</button>
+      <button id="btnRestart" class="btn" type="button">重启</button>
+      <button id="btnStop" class="btn danger" type="button">停止</button>
+    </section>
+
+    <section class="open-row">
+      <button id="btnOpen" class="btn ghost" type="button">打开 DSH 页面</button>
+      <button id="btnToggleLog" class="btn ghost" type="button">查看日志</button>
+    </section>
+
+    <section id="logSection" class="log-section hidden">
+      <pre id="log" class="log"></pre>
+    </section>
+
+    <footer class="footer">
+      <span>守护进程：127.0.0.1:9317</span>
+      <span>服务：127.0.0.1:3080</span>
+    </footer>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

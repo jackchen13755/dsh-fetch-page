@@ -67,6 +67,25 @@ async function ctl(action) {
   }
 }
 
+async function getLifecycle() {
+  try {
+    const r = await fetch(BASE + '/lifecycle', { signal: AbortSignal.timeout(5000) });
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: String(e && e.message || e) };
+  }
+}
+
+async function getLogs(name, lines) {
+  try {
+    const q = new URLSearchParams({ name: name || 'dsh', lines: String(lines || 300) });
+    const r = await fetch(BASE + '/logs?' + q.toString(), { signal: AbortSignal.timeout(5000) });
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: String(e && e.message || e) };
+  }
+}
+
 // 系统通知 + 图标角标反馈
 function notify(title, message, ok) {
   try {
@@ -96,13 +115,14 @@ function flashBadge(ok) {
   } catch (e) {}
 }
 
-// 已有 DSH 页面则定位（激活并聚焦）该标签页，否则新建标签页。
+// 已有 DSH 页面则定位（激活并聚焦）该标签页并刷新，否则新建标签页。
 function openPage() {
   chrome.tabs.query({}, (tabs) => {
     const found = tabs.find((t) => t.url && t.url.startsWith(DSH_URL));
     if (found) {
       chrome.tabs.update(found.id, { active: true });
       chrome.windows.update(found.windowId, { focused: true });
+      try { chrome.tabs.reload(found.id); } catch (e) {}
     } else {
       chrome.tabs.create({ url: DSH_URL });
     }
@@ -120,6 +140,26 @@ chrome.action.onClicked.addListener(async () => {
   if (r.ok) openPage();
   else { notify('启动失败', r.error || '未知错误', false); flashBadge(false); }
   updateIcon();
+});
+
+// ── Popup 消息（状态 / 生命周期 / 控制 / 日志）──────────────────────────
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || typeof msg.type !== 'string') return false;
+  const types = ['getStatus', 'getLifecycle', 'start', 'stop', 'restart', 'openPage', 'getLogs'];
+  if (!types.includes(msg.type)) return false;
+  const run = async () => {
+    switch (msg.type) {
+      case 'getStatus': return ctl('status');
+      case 'getLifecycle': return getLifecycle();
+      case 'start': { const r = await ctl('start'); updateIcon(); return r; }
+      case 'stop': { const r = await ctl('stop'); updateIcon(); return r; }
+      case 'restart': { const r = await ctl('restart'); updateIcon(); return r; }
+      case 'openPage': openPage(); return { ok: true };
+      case 'getLogs': return getLogs(msg.name, msg.lines);
+    }
+  };
+  run().then(sendResponse).catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+  return true;
 });
 
 // ── DSH 版本检查 / 更新 ──────────────────────────────────────────────────

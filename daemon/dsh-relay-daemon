@@ -35,6 +35,17 @@ const results = new Map();
 let updating = false;
 let updateState = { state: 'idle', startedAt: null, finishedAt: null, step: '', message: '', error: null, warnings: [], detail: [] };
 
+// ---- 服务生命周期状态（启动/停止/重启进度） ----
+let lifecycle = {
+  state: 'idle',        // idle | starting | running | stopping | restarting | failed
+  startedAt: null,
+  finishedAt: null,
+  step: '',
+  message: '',
+  error: null,
+  log: '',
+};
+
 function log(msg) {
   try { fs.appendFileSync(CTL_LOG, new Date().toISOString() + ' ' + msg + '\n'); } catch (e) {}
 }
@@ -145,6 +156,19 @@ function setUpdate(partial) {
   log('update: ' + JSON.stringify(partial));
 }
 
+function setLifecycle(partial) {
+  lifecycle = Object.assign({}, lifecycle, partial);
+  log('lifecycle: ' + JSON.stringify(partial));
+}
+
+async function readLogTail(file, lines) {
+  try {
+    const s = await fs.promises.readFile(file, 'utf8');
+    const arr = s.split('\n');
+    return arr.slice(-(lines || 100)).join('\n');
+  } catch (e) { return ''; }
+}
+
 function appendDetail(line) {
   if (updateState.detail.length >= 300) updateState.detail.shift();
   updateState.detail.push(line);
@@ -182,9 +206,16 @@ async function waitFree(secs) {
 
 async function startDsh() {
   log('startDsh');
+  setLifecycle({ state: 'starting', startedAt: new Date().toISOString(), finishedAt: null, step: '启动进程', message: '正在启动 DSH 进程', error: null, log: '' });
   await sh('cd ' + shq(DSH_DIR) + ' && nohup ' + DSH_START + ' > ' + DSH_LOG + ' 2>&1 &');
+  setLifecycle({ state: 'starting', step: '等待端口', message: '正在等待端口 ' + DSH_PORT + ' 就绪' });
   await sh('for ((i=0;i<15;i++)); do ' + LSOF + ' -ti tcp:' + DSH_PORT + ' -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 1; done');
   const pid = await currentPid();
+  if (pid) {
+    setLifecycle({ state: 'running', step: '已启动', message: 'DSH 已启动 (PID ' + pid + ')', error: null, finishedAt: new Date().toISOString() });
+  } else {
+    setLifecycle({ state: 'failed', step: '启动失败', message: 'DSH 启动失败', error: '端口 ' + DSH_PORT + ' 未在 15 秒内就绪', finishedAt: new Date().toISOString() });
+  }
   log('started pid=' + pid);
   return pid;
 }
@@ -195,21 +226,38 @@ async function ctlStatus() {
 }
 async function ctlStart() {
   const pid = await currentPid();
-  if (pid) return { ok: true, running: true, pid: pid, status: 'already-running' };
+  if (pid) {
+    setLifecycle({ state: 'running', step: '已在运行', message: 'DSH 已在运行 (PID ' + pid + ')', error: null, finishedAt: new Date().toISOString() });
+    return { ok: true, running: true, pid: pid, status: 'already-running' };
+  }
   const np = await startDsh();
-  return { ok: true, running: !!np, pid: np || null, status: 'started' };
+  if (np) return { ok: true, running: true, pid: np, status: 'started' };
+  const logTail = await readLogTail(DSH_LOG, 100);
+  const errMsg = lifecycle.error || 'DSH 启动失败：端口 ' + DSH_PORT + ' 未在限定时间内就绪';
+  setLifecycle({ state: 'failed', step: '启动失败', error: errMsg, message: errMsg, log: logTail, finishedAt: new Date().toISOString() });
+  return { ok: false, error: errMsg, log: logTail };
 }
 async function ctlStop() {
   const pid = await currentPid();
-  if (!pid) return { ok: true, running: false, status: 'not-running' };
+  if (!pid) {
+    setLifecycle({ state: 'idle', step: '未运行', message: 'DSH 未在运行', error: null, finishedAt: new Date().toISOString() });
+    return { ok: true, running: false, status: 'not-running' };
+  }
+  setLifecycle({ state: 'stopping', startedAt: new Date().toISOString(), finishedAt: null, step: '停止中', message: '正在停止 DSH (PID ' + pid + ')', error: null });
   await killPid(pid);
+  setLifecycle({ state: 'idle', step: '已停止', message: 'DSH 已停止', error: null, finishedAt: new Date().toISOString() });
   return { ok: true, running: false, status: 'stopped', pid: pid };
 }
 async function ctlRestart() {
   const pid = await currentPid();
+  setLifecycle({ state: 'restarting', startedAt: new Date().toISOString(), finishedAt: null, step: '停止旧进程', message: pid ? '正在停止旧进程 (PID ' + pid + ')' : 'DSH 未运行，直接启动', error: null, log: '' });
   if (pid) { await killPid(pid); await waitFree(5); }
   const np = await startDsh();
-  return { ok: true, running: !!np, pid: np || null, status: 'restarted', oldPid: pid || null };
+  if (np) return { ok: true, running: true, pid: np, status: 'restarted', oldPid: pid || null };
+  const logTail = await readLogTail(DSH_LOG, 100);
+  const errMsg = lifecycle.error || 'DSH 重启失败：端口 ' + DSH_PORT + ' 未在限定时间内就绪';
+  setLifecycle({ state: 'failed', step: '重启失败', error: errMsg, message: errMsg, log: logTail, finishedAt: new Date().toISOString() });
+  return { ok: false, error: errMsg, log: logTail };
 }
 
 // ---- 更新流程：拉取 + 保留本地修改 + 重装/重建 ----
@@ -297,7 +345,7 @@ async function runUpdate() {
   }
 }
 
-const server = http.createServer(function (req, res) {
+const server = http.createServer(async function (req, res) {
   // ---- 生命周期控制端点 ----
   if (req.method === 'GET' && req.url === '/status') {
     ctlStatus().then((r) => respond(res, r), (e) => respond(res, { ok: false, error: String((e && e.message) || e) }, 500));
@@ -334,6 +382,25 @@ const server = http.createServer(function (req, res) {
     updating = true;
     runUpdate();
     respond(res, { ok: true, started: true, state: 'running' });
+    return;
+  }
+
+  // ---- 服务生命周期 / 日志端点 ----
+  if (req.method === 'GET' && req.url === '/lifecycle') {
+    const pid = await currentPid();
+    respond(res, { ok: true, running: !!pid, pid: pid || null, ...lifecycle });
+    return;
+  }
+  if (req.method === 'GET' && req.url.startsWith('/logs')) {
+    const u = new URL(req.url, 'http://localhost');
+    const name = u.searchParams.get('name') === 'daemon' ? 'daemon' : 'dsh';
+    const lines = Math.min(parseInt(u.searchParams.get('lines') || '300', 10) || 300, 2000);
+    const file = name === 'daemon' ? CTL_LOG : DSH_LOG;
+    fs.readFile(file, 'utf8', (err, data) => {
+      if (err) { respond(res, { ok: false, error: '无法读取日志 ' + file + '：' + err.message }, 500); return; }
+      const arr = data.split('\n');
+      respond(res, { ok: true, name: name, file: file, lines: lines, log: arr.slice(-lines).join('\n') });
+    });
     return;
   }
 
