@@ -209,7 +209,7 @@ async function startDsh() {
   setLifecycle({ state: 'starting', startedAt: new Date().toISOString(), finishedAt: null, step: '启动进程', message: '正在启动 DSH 进程', error: null, log: '' });
   await sh('cd ' + shq(DSH_DIR) + '; nohup ' + DSH_START + ' > ' + DSH_LOG + ' 2>&1 < /dev/null &');
   setLifecycle({ state: 'starting', step: '等待端口', message: '正在等待端口 ' + DSH_PORT + ' 就绪' });
-  await sh('for ((i=0;i<15;i++)); do ' + LSOF + ' -ti tcp:' + DSH_PORT + ' -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 1; done');
+  await sh('for ((i=0;i<75;i++)); do ' + LSOF + ' -ti tcp:' + DSH_PORT + ' -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.2; done');
   const pid = await currentPid();
   if (pid) {
     setLifecycle({ state: 'running', step: '已启动', message: 'DSH 已启动 (PID ' + pid + ')', error: null, finishedAt: new Date().toISOString() });
