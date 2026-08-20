@@ -64,7 +64,14 @@ function respond(res, obj, status) {
 
 function sh(cmd, timeout) {
   return new Promise((resolve) => {
-    execFile('/bin/bash', ['-c', cmd], { timeout: timeout || 30000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+    // launchd 下 PATH 极简(/usr/bin:/bin:/usr/sbin:/sbin),缺少 node/pnpm 所在目录,
+    // 会导致 pnpm 的 lifecycle 脚本报 `env: node: No such file or directory`。
+    // 这里把 node 可执行文件目录和 /usr/local/bin 前置。
+    const nodeBin = path.dirname(NODE);
+    const env = Object.assign({}, process.env, {
+      PATH: [nodeBin, '/usr/local/bin', process.env.PATH].filter(Boolean).join(':'),
+    });
+    execFile('/bin/bash', ['-c', cmd], { timeout: timeout || 30000, maxBuffer: 16 * 1024 * 1024, env: env }, (err, stdout, stderr) => {
       resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout: String(stdout), stderr: String(stderr) });
     });
   });
@@ -212,10 +219,32 @@ async function startDsh() {
   setLifecycle({ state: 'starting', step: '等待端口', message: '正在等待端口 ' + DSH_PORT + ' 就绪' });
   await sh('for ((i=0;i<75;i++)); do ' + LSOF + ' -ti tcp:' + DSH_PORT + ' -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.2; done');
   const pid = await currentPid();
-  if (pid) {
-    setLifecycle({ state: 'running', step: '已启动', message: 'DSH 已启动 (PID ' + pid + ')', error: null, finishedAt: new Date().toISOString() });
+  if (!pid) {
+    const logTail = await readLogTail(DSH_LOG, 100);
+    setLifecycle({ state: 'failed', step: '启动失败', message: 'DSH 启动失败', error: '端口 ' + DSH_PORT + ' 未在 15 秒内就绪', log: logTail, finishedAt: new Date().toISOString() });
+    log('start failed (no listener)');
+    return null;
+  }
+  // 端口就绪 ≠ boot 完成:插件树/client-modules 组合在 bind 之后仍可能崩溃。
+  // 做健康检查:进程存活 + HTTP 响应 2xx/3xx(最多再等 20 秒)。
+  setLifecycle({ state: 'starting', step: '健康检查', message: '端口已监听，正在等待 Web 服务就绪 (PID ' + pid + ')' });
+  let healthy = false;
+  for (let i = 0; i < 20; i++) {
+    const aliveR = await sh('ps -p ' + pid + ' >/dev/null 2>&1 && echo yes || echo no');
+    if (aliveR.stdout.trim() !== 'yes') break;
+    const httpR = await sh('curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://127.0.0.1:' + DSH_PORT + '/ 2>/dev/null || echo 000');
+    const code = String(httpR.stdout).trim();
+    if (/^[23][0-9][0-9]$/.test(code)) { healthy = true; break; }
+    await sh('sleep 1');
+  }
+  if (healthy) {
+    setLifecycle({ state: 'running', step: '已启动', message: 'DSH 已启动 (PID ' + pid + ')，健康检查通过', error: null, finishedAt: new Date().toISOString() });
   } else {
-    setLifecycle({ state: 'failed', step: '启动失败', message: 'DSH 启动失败', error: '端口 ' + DSH_PORT + ' 未在 15 秒内就绪', finishedAt: new Date().toISOString() });
+    const logTail = await readLogTail(DSH_LOG, 100);
+    const msg = 'DSH 启动后未通过健康检查（进程崩溃或 Web 服务未就绪）';
+    setLifecycle({ state: 'failed', step: '启动失败', message: msg, error: msg, log: logTail, finishedAt: new Date().toISOString() });
+    log('start failed (health check)');
+    return null;
   }
   log('started pid=' + pid);
   return pid;
@@ -262,15 +291,18 @@ async function ctlRestart() {
 }
 
 // ---- 更新流程：拉取 + 保留本地修改 + 重装/重建 ----
-async function runUpdate() {
-  setUpdate({ state: 'running', startedAt: new Date().toISOString(), finishedAt: null, step: '准备检查仓库', message: '', error: null, warnings: [], detail: [] });
+// force=true:跳过版本检查,即使已是最新也重装依赖+重建+重启(修复半损坏的安装)。
+async function runUpdate(force) {
+  force = force === true;
+  setUpdate({ state: 'running', startedAt: new Date().toISOString(), finishedAt: null, step: force ? '准备修复/重装' : '准备检查仓库', message: '', error: null, warnings: [], detail: [] });
   try {
     const info = await getUpdateInfo(true);
     if (!info.ok) throw new Error('无法获取更新信息');
-    if (!info.hasUpdate) {
+    if (!info.hasUpdate && !force) {
       setUpdate({ state: 'completed', step: '已是最新', message: '当前已是最新版本，无需更新', finishedAt: new Date().toISOString() });
       return;
     }
+    const doMerge = info.hasUpdate;
 
     const wasRunning = !!(await currentPid());
     if (wasRunning) {
@@ -281,35 +313,37 @@ async function runUpdate() {
 
     // 只暂存“已跟踪文件”的本地修改；未跟踪的本地插件/构建产物原样保留。
     let stashed = false;
-    const diffR = await git('diff --quiet 2>/dev/null');
-    const cachedR = await git('diff --cached --quiet 2>/dev/null');
-    if (diffR.code !== 0 || cachedR.code !== 0) {
-      setUpdate({ step: '暂存本地修改', message: '更新前暂存本地已跟踪修改，完成后自动恢复' });
-      const stashName = 'dsh-update-auto-' + Date.now();
-      const sr = await git('stash push -m ' + shq(stashName) + ' --quiet', 60000);
-      if (sr.code !== 0) throw new Error('暂存本地修改失败（未执行更新，原文件未动）：' + tail(sr.stderr || sr.stdout, 2000));
-      stashed = true;
-      appendDetail('stash: ' + stashName);
-    }
-
-    setUpdate({ step: '拉取远端更新', message: '正在从 ' + REMOTE + '/' + info.branch + ' 拉取' });
-    const mr = await git('merge --ff-only ' + REMOTE + '/' + info.branch + ' 2>&1', FETCH_TIMEOUT);
-    if (mr.code !== 0) {
-      if (stashed) {
-        setUpdate({ step: '拉取失败，恢复本地修改', message: '更新失败，正在恢复本地修改' });
-        await git('stash pop 2>&1', 60000);
+    if (doMerge) {
+      const diffR = await git('diff --quiet 2>/dev/null');
+      const cachedR = await git('diff --cached --quiet 2>/dev/null');
+      if (diffR.code !== 0 || cachedR.code !== 0) {
+        setUpdate({ step: '暂存本地修改', message: '更新前暂存本地已跟踪修改，完成后自动恢复' });
+        const stashName = 'dsh-update-auto-' + Date.now();
+        const sr = await git('stash push -m ' + shq(stashName) + ' --quiet', 60000);
+        if (sr.code !== 0) throw new Error('暂存本地修改失败（未执行更新，原文件未动）：' + tail(sr.stderr || sr.stdout, 2000));
+        stashed = true;
+        appendDetail('stash: ' + stashName);
       }
-      throw new Error('拉取更新失败（本地修改已保留）：' + tail(mr.stderr || mr.stdout, 2000));
-    }
-    appendDetail('merge ok');
 
-    if (stashed) {
-      setUpdate({ step: '恢复本地修改', message: '正在恢复更新前暂存的本地修改' });
-      const pr = await git('stash pop 2>&1', 60000);
-      if (pr.code !== 0) {
-        updateState.warnings.push('拉取成功，但自动恢复本地修改时出现冲突，本地修改已保留在工作区，请手动处理：git stash list');
-        appendDetail('stash pop warning: ' + tail(pr.stderr || pr.stdout, 2000));
-        throw new Error('拉取完成，但恢复本地修改时出现冲突（本地修改已保留，未覆盖）；请手动解决冲突后重新构建。');
+      setUpdate({ step: '拉取远端更新', message: '正在从 ' + REMOTE + '/' + info.branch + ' 拉取' });
+      const mr = await git('merge --ff-only ' + REMOTE + '/' + info.branch + ' 2>&1', FETCH_TIMEOUT);
+      if (mr.code !== 0) {
+        if (stashed) {
+          setUpdate({ step: '拉取失败，恢复本地修改', message: '更新失败，正在恢复本地修改' });
+          await git('stash pop 2>&1', 60000);
+        }
+        throw new Error('拉取更新失败（本地修改已保留）：' + tail(mr.stderr || mr.stdout, 2000));
+      }
+      appendDetail('merge ok');
+
+      if (stashed) {
+        setUpdate({ step: '恢复本地修改', message: '正在恢复更新前暂存的本地修改' });
+        const pr = await git('stash pop 2>&1', 60000);
+        if (pr.code !== 0) {
+          updateState.warnings.push('拉取成功，但自动恢复本地修改时出现冲突，本地修改已保留在工作区，请手动处理：git stash list');
+          appendDetail('stash pop warning: ' + tail(pr.stderr || pr.stdout, 2000));
+          throw new Error('拉取完成，但恢复本地修改时出现冲突（本地修改已保留，未覆盖）；请手动解决冲突后重新构建。');
+        }
       }
     }
 
@@ -322,7 +356,7 @@ async function runUpdate() {
     const br = await sh('cd ' + shq(DSH_DIR) + ' && ' + pkgm.build + ' 2>&1', BUILD_TIMEOUT);
     if (br.code !== 0) throw new Error('构建失败：' + tail(br.stderr || br.stdout, 3000));
 
-    if (wasRunning) {
+    if (wasRunning || force) {
       setUpdate({ step: '重新启动 DSH', message: '正在重新启动 DSH 服务' });
       await ctlStart();
     }
@@ -330,7 +364,7 @@ async function runUpdate() {
     setUpdate({
       state: 'completed',
       step: '完成',
-      message: 'DSH 已更新并重新构建，本地插件/设置已保留',
+      message: doMerge ? 'DSH 已更新并重新构建，本地插件/设置已保留' : 'DSH 已重装依赖并重新构建',
       finishedAt: new Date().toISOString(),
     });
   } catch (e) {
@@ -378,11 +412,13 @@ const server = http.createServer(async function (req, res) {
     respond(res, { ok: true, updating: updating, ...updateState });
     return;
   }
-  if (req.method === 'POST' && req.url === '/update') {
+  if (req.method === 'POST' && (req.url === '/update' || req.url.startsWith('/update?') || req.url === '/repair' || req.url.startsWith('/repair?'))) {
     if (updating) { respond(res, { ok: false, error: '已有更新任务正在执行', state: updateState.state }); return; }
+    const u = new URL(req.url, 'http://localhost');
+    const force = req.url.startsWith('/repair') || u.searchParams.get('force') === '1' || u.searchParams.get('force') === 'true';
     updating = true;
-    runUpdate();
-    respond(res, { ok: true, started: true, state: 'running' });
+    runUpdate(force);
+    respond(res, { ok: true, started: true, state: 'running', force: force });
     return;
   }
 

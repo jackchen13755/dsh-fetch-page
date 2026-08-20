@@ -4,6 +4,9 @@
  * state) travels with the request while CORS is bypassed by the extension's
  * background fetch.
  *
+ * 新增 SPA 渲染模式：`mode: "render"` 时扩展会在真实标签页中执行 JS，
+ * 等待 SPA 渲染稳定后用 Readability + Turndown 提取正文（Markdown/Text/HTML）。
+ *
  * @module @deepseek-ai/dsh-tool-fetch-page
  */
 import type { Context } from '@deepseek-ai/cordis';
