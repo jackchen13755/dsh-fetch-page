@@ -214,6 +214,18 @@ async function waitFree(secs) {
 
 async function startDsh() {
   log('startDsh');
+  // dsh 引擎要求 node ^22.19 || >=24;全局 node 被切回旧版(如 n 20.x)时,这里直接报错,
+  // 而不是拉起一个注定在插件树阶段崩溃的 boot。
+  const mv = /^v(\d+)\.(\d+)\./.exec(process.version);
+  const major = mv ? Number(mv[1]) : 0;
+  const minor = mv ? Number(mv[2]) : 0;
+  const nodeOk = (major === 22 && minor >= 19) || major >= 24;
+  if (!nodeOk) {
+    const msg = '当前 node ' + process.version + ' 不满足 dsh 引擎要求 (^22.19 || >=24)，请切换 node（如 n 24.19.0）后重启 daemon';
+    setLifecycle({ state: 'failed', startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), step: '启动失败', message: msg, error: msg, log: '' });
+    log('start failed (node version)');
+    return null;
+  }
   setLifecycle({ state: 'starting', startedAt: new Date().toISOString(), finishedAt: null, step: '启动进程', message: '正在启动 DSH 进程', error: null, log: '' });
   await sh('cd ' + shq(DSH_DIR) + ' || { echo "cd failed: ' + DSH_DIR + '"; exit 1; }; nohup ' + DSH_START + ' > ' + DSH_LOG + ' 2>&1 < /dev/null &');
   setLifecycle({ state: 'starting', step: '等待端口', message: '正在等待端口 ' + DSH_PORT + ' 就绪' });
@@ -515,4 +527,5 @@ const server = http.createServer(async function (req, res) {
 
 server.listen(PORT, '127.0.0.1', function () {
   console.log('dsh-relay-daemon on 127.0.0.1:' + PORT);
+  log('daemon started node=' + process.version + ' execPath=' + NODE);
 });
