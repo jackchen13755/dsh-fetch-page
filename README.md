@@ -156,6 +156,28 @@ fetch_page url=https://app.example.com/dashboard mode=render wait_for_selector=.
 
 返回：HTTP 状态码、响应头、正文；渲染模式返回 Markdown 正文并附带 `title/text/url/rendered` 字段。
 
+### 解决禅道 Bug（zentao_resolve_bug）
+
+`dsh-plugin` 还提供 `zentao_resolve_bug` 工具：通过浏览器扩展桥接读取禅道
+（`zen.sgrl.io`）当前登录态的 Bug 详情与解决表单，解析 `uid`/默认值/必填项，
+再提交解决。整个链路复用 `fetch_page` 的浏览器插件桥接，**无需读取 Chrome Cookie 权限**。
+
+```
+zentao_resolve_bug bugID=1234 \\
+  dryRun=true                  # 只解析并返回提交字段，不真正提交
+```
+
+常用参数：
+
+- `bugID`：必填，禅道 Bug ID
+- `resolution`：解决方案，默认 `fixed`（`bydesign`/`duplicate`/`external`/`fixed`/`notrepro`/`postponed`/`willnotfix`）
+- `reason`：Bug 产生原因，默认 `codeBug`
+- `build`：解决版本 build ID；缺省自动取该 Bug 最近一次解决版本，其次取解决表单默认 `resolvedBuild`
+- `comment` / `detail` / `impact`：备注 / bug 详细原因 / 代码变更影响范围
+- `assignedTo` / `inChargedBy`：指派给 / Bug 所属人（`inChargedBy` 在该实例为必填，建议显式指定）
+- `force`：当前已是「已解决」时仍强制再次解决
+- `dryRun`：只解析并返回提交字段，不真正提交
+
 ### 验证开发结果
 
 `browser-plugin` 提供 `verify_page` 工具：打开真实 Chrome 页面，按 JSON 断言契约校验
