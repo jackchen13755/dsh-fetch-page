@@ -184,7 +184,7 @@ print(json.dumps(report, ensure_ascii=False, default=str))
 `
 }
 
-function extractReport(out: string): Record<string, unknown> | null {
+function extractReport(out: string): Record<string, any> | null {
   const text = (out || '').trim()
   if (!text) return null
   // browser-harness 可能先打印更新横幅，从第一个 { 开始尝试解析
@@ -318,10 +318,10 @@ export function apply(ctx: Context, config: Config = {}): void {
         const ok = value.ok === true
         const title = typeof value.title === 'string' && value.title !== '' ? ` · ${value.title}` : ''
         const url = typeof value.url === 'string' ? value.url : ''
-        const assertions = Array.isArray(value.assertions) ? value.assertions : []
-        const failed = assertions.filter((a: { pass?: boolean }) => a && a.pass !== true)
-        const consoleErrors = Array.isArray(value.consoleErrors) ? value.consoleErrors : []
-        const networkErrors = Array.isArray(value.networkErrors) ? value.networkErrors : []
+        const assertions = (Array.isArray(value.assertions) ? value.assertions : []) as unknown as Array<{ pass?: boolean; [key: string]: unknown }>
+        const failed = assertions.filter((a) => !!a && a.pass !== true)
+        const consoleErrors = (Array.isArray(value.consoleErrors) ? value.consoleErrors : []) as unknown as Array<{ level?: unknown; text?: unknown }>
+        const networkErrors = (Array.isArray(value.networkErrors) ? value.networkErrors : []) as unknown as Array<{ errorText?: unknown; url?: unknown }>
         const lines: string[] = []
         lines.push(`${ok ? '✅ 验证通过' : '❌ 验证失败'}${title}`)
         lines.push(`URL: ${url}`)
@@ -359,7 +359,14 @@ export function apply(ctx: Context, config: Config = {}): void {
         return [textBlock(lines.join('\n'))]
       },
     },
-    async execute(args, _exec) {
+    async execute(args: {
+      url?: string
+      assertions?: unknown[]
+      wait_for_selector?: string
+      timeout?: number
+      screenshot?: boolean
+      fail_on_console_errors?: boolean
+    }, _exec) {
       const tmpBase = `/tmp/bh-verify-${Date.now()}-${Math.random().toString(36).slice(2)}`
       const specPath = `${tmpBase}.json`
       const pyPath = `${tmpBase}.py`

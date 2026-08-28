@@ -171,6 +171,7 @@ function extractReport(out) {
     const text = (out || '').trim();
     if (!text)
         return null;
+    // browser-harness 可能先打印更新横幅，从第一个 { 开始尝试解析
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
     if (start >= 0 && end > start) {
@@ -300,10 +301,10 @@ export function apply(ctx, config = {}) {
                 const ok = value.ok === true;
                 const title = typeof value.title === 'string' && value.title !== '' ? ` · ${value.title}` : '';
                 const url = typeof value.url === 'string' ? value.url : '';
-                const assertions = Array.isArray(value.assertions) ? value.assertions : [];
-                const failed = assertions.filter((a) => a && a.pass !== true);
-                const consoleErrors = Array.isArray(value.consoleErrors) ? value.consoleErrors : [];
-                const networkErrors = Array.isArray(value.networkErrors) ? value.networkErrors : [];
+                const assertions = (Array.isArray(value.assertions) ? value.assertions : []);
+                const failed = assertions.filter((a) => !!a && a.pass !== true);
+                const consoleErrors = (Array.isArray(value.consoleErrors) ? value.consoleErrors : []);
+                const networkErrors = (Array.isArray(value.networkErrors) ? value.networkErrors : []);
                 const lines = [];
                 lines.push(`${ok ? '✅ 验证通过' : '❌ 验证失败'}${title}`);
                 lines.push(`URL: ${url}`);
@@ -377,3 +378,4 @@ export function apply(ctx, config = {}) {
         },
     }));
 }
+//# sourceMappingURL=index.js.map

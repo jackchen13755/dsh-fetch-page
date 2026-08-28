@@ -110,7 +110,7 @@ function tagByName(html: string, tag: string, name: string): string {
 function selectedValue(html: string, name: string): string {
   const selMatch = html.match(new RegExp(`<select\\b[^>]*\\bname=(['\"])${name}\\1[^>]*>([\\s\\S]*?)<\\/select>`))
   if (!selMatch) return ''
-  const options = selMatch[2].match(/<option\b[^>]*>[\s\S]*?<\/option>|<option[^>]*\/?>/g) || []
+  const options = (selMatch[2] ?? '').match(/<option\b[^>]*>[\s\S]*?<\/option>|<option[^>]*\/?>/g) || []
   for (const opt of options) {
     if (/\bselected\b/.test(opt)) {
       const vm = opt.match(/\bvalue=(['"])(.*?)\1/)
@@ -267,8 +267,8 @@ export function apply(ctx: Context, config: Config = {}): void {
           mode: typeof args.mode === 'string' ? (args.mode as any) : 'auto',
           wait_for_selector: args.wait_for_selector ?? '',
           target_selector: args.target_selector ?? '',
-          timeout: args.timeout,
-          scroll: args.scroll,
+          ...(args.timeout !== undefined ? { timeout: args.timeout } : {}),
+          ...(args.scroll !== undefined ? { scroll: args.scroll } : {}),
           format: args.format ?? 'markdown',
         })
       } catch (error) {

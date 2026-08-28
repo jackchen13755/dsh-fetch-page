@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build: compile src/ → lib/ with locally installed npm dependencies.
 # Works without a dsh source checkout: devDependencies (cordis, dsh-tools,
-# dsh-shell, schemastery, typescript) are installed from npm on demand.
+# dsh-shell, typescript) are installed from npm on demand.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -13,13 +13,6 @@ REGISTRY="${NPM_REGISTRY:-https://registry.npmmirror.com}"
 echo "=== Ensuring build dependencies (registry: $REGISTRY) ==="
 if [ ! -x node_modules/.bin/tsc ]; then
   npm install --registry "$REGISTRY" --no-audit --no-fund
-fi
-
-# 裸名兼容:外部插件 import 'cordis' / 'schemastery' 时,共享层只有
-# rescoped 的 @deepseek-ai/cordis;这里若源码用了裸名,链接一份供类型解析。
-if grep -rq "from 'cordis'" src/ 2>/dev/null && [ ! -e node_modules/cordis ]; then
-  mkdir -p node_modules
-  ln -sfn @deepseek-ai/cordis node_modules/cordis
 fi
 
 echo "=== Compiling src → lib ==="

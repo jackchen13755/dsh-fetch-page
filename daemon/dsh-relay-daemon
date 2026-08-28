@@ -256,7 +256,7 @@ async function startDsh() {
   setLifecycle({ state: 'starting', startedAt: new Date().toISOString(), finishedAt: null, step: '启动进程', message: '正在启动 DSH 进程', error: null, log: '' });
   await sh('cd ' + shq(DSH_DIR) + ' || { echo "cd failed: ' + DSH_DIR + '"; exit 1; }; nohup ' + DSH_START + ' > ' + DSH_LOG + ' 2>&1 < /dev/null &');
   setLifecycle({ state: 'starting', step: '等待端口', message: '正在等待端口 ' + DSH_PORT + ' 就绪' });
-  await sh('for ((i=0;i<75;i++)); do ' + LSOF + ' -ti tcp:' + DSH_PORT + ' -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.2; done');
+  await sh('for ((i=0;i<150;i++)); do ' + LSOF + ' -ti tcp:' + DSH_PORT + ' -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.2; done');
   const pid = await currentPid();
   if (!pid) {
     const logTail = await readLogTail(DSH_LOG, 100);
@@ -265,7 +265,7 @@ async function startDsh() {
     return null;
   }
   // 端口就绪 ≠ boot 完成:插件树/client-modules 组合在 bind 之后仍可能崩溃。
-  // 做健康检查:进程存活 + HTTP 响应 2xx/3xx(最多再等 20 秒)。
+  // 做健康检查:进程存活 + HTTP 响应 2xx/3xx(401 = token 门禁下的已就绪服务,同样视为健康;最多再等 20 秒)。
   setLifecycle({ state: 'starting', step: '健康检查', message: '端口已监听，正在等待 Web 服务就绪 (PID ' + pid + ')' });
   let healthy = false;
   for (let i = 0; i < 20; i++) {
@@ -273,7 +273,7 @@ async function startDsh() {
     if (aliveR.stdout.trim() !== 'yes') break;
     const httpR = await sh('curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://127.0.0.1:' + DSH_PORT + '/ 2>/dev/null || echo 000');
     const code = String(httpR.stdout).trim();
-    if (/^[23][0-9][0-9]$/.test(code)) { healthy = true; break; }
+    if (/^(?:[23][0-9][0-9]|401)$/.test(code)) { healthy = true; break; }
     await sh('sleep 1');
   }
   if (healthy) {
