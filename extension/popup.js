@@ -264,8 +264,10 @@ let updatePollTimer = null;
 
 function formatVersion(v) {
   if (!v) return '—';
+  // npm 包模式:只有 packageVersion(无 commit);兼容旧版 git 信息
   if (v.packageVersion && v.shortCommit) return v.packageVersion + ' (' + v.shortCommit + ')';
-  return v.packageVersion || v.shortCommit || v.commit || '—';
+  if (v.packageVersion) return v.packageVersion;
+  return v.shortCommit || v.commit || '—';
 }
 
 function setUpdateBusy(v) {
@@ -290,7 +292,7 @@ function renderVersion(info) {
   $('versionCurrent').textContent = '当前版本：' + formatVersion(info.current);
   $('versionLatest').textContent = '最新版本：' + formatVersion(info.latest);
   if (info.hasUpdate) {
-    $('updateStatus').textContent = '发现新版本（落后 ' + (info.behind || '?') + ' 个提交）';
+    $('updateStatus').textContent = '发现新版本 ' + formatVersion(info.latest);
     $('updateStatus').className = 'version-status has-update';
   } else {
     $('updateStatus').textContent = '当前已是最新版本';

@@ -283,8 +283,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 function formatVersion(v) {
   if (!v) return '未知';
+  // npm 包模式:只有 packageVersion(无 commit);兼容旧版 git 信息
   if (v.packageVersion && v.shortCommit) return v.packageVersion + ' (' + v.shortCommit + ')';
-  return v.packageVersion || v.shortCommit || v.commit || '未知';
+  if (v.packageVersion) return v.packageVersion;
+  return v.shortCommit || v.commit || '未知';
 }
 
 // 版本检查结果缓存（popup 经 getVersionInfo 读取）。
@@ -332,10 +334,10 @@ async function checkForUpdates(manual) {
         iconUrl: chrome.runtime.getURL('icon-running-blue.png'),
         title: 'DSH 有新版本',
         message: '当前 ' + currentLabel + ' → 最新 ' + latestLabel +
-          '（落后 ' + (info.behind || '?') + ' 个提交）\n点击“下载并重建”，本地插件/设置不会被覆盖。',
+          '\n点击“更新并重启”，本地插件/设置不会被覆盖。',
         priority: 2,
         requireInteraction: true,
-        buttons: [{ title: '下载并重建' }, { title: '稍后' }],
+        buttons: [{ title: '更新并重启' }, { title: '稍后' }],
       });
       chrome.storage.local.set({ notifiedUpdateKey: key });
     });
@@ -376,7 +378,7 @@ async function startUpdate() {
     notify('更新失败', failed.error, false);
     return failed;
   }
-  notify('开始更新', '正在拉取最新 DSH 并重新构建，本地插件/设置会保留。', true);
+  notify('开始更新', '正在拉取最新 DSH 并重启，本地插件/设置会保留。', true);
   chrome.alarms.create(UPDATE_POLL_ALARM, { periodInMinutes: POLL_INTERVAL_MINUTES });
   pollUpdateStatus();
   return { ok: true, started: true };

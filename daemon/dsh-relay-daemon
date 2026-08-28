@@ -12,24 +12,25 @@ process.env.UV_INDEX_URL = process.env.UV_INDEX_URL || 'https://mirrors.aliyun.c
 process.env.HF_ENDPOINT = process.env.HF_ENDPOINT || 'https://hf-mirror.com';
 
 const PORT = Number(process.env.DSH_DAEMON_PORT || 9317);
-// 本机 DSH checkout 路径。也可用环境变量 DSH_CHECKOUT 覆盖。
-const DSH_DIR = process.env.DSH_CHECKOUT || path.join(os.homedir(), 'Desktop', 'work', 'deepseek-harness');
+// npm 包安装模式：dsh 由 `npx -y @deepseek-ai/dsh` 提供（npm latest），
+// 不再依赖本地 git checkout。可用环境变量 DSH_NPM_PKG 覆盖包名。
+const NPM_PKG = process.env.DSH_NPM_PKG || '@deepseek-ai/dsh';
 const DSH_PORT = Number(process.env.DSH_PORT || 3080);
 const DSH_LOG = '/tmp/dsh-web-' + DSH_PORT + '.log';
 const CTL_LOG = '/tmp/dsh-relay-daemon.log';
 const LSOF = '/usr/sbin/lsof';
 const NODE = process.execPath;
-// DSH 启动命令。默认走 tsx 源码启动（与 dsh-web 启动器一致）；生产模式可整条覆盖：
-//   DSH_START_CMD="node /abs/path/to/deepseek-harness/apps/cli/lib/bin.js web --port 3080"
+const NPM = process.env.DSH_NPM_CMD || path.join(path.dirname(NODE), 'npm');
+const NPX = process.env.DSH_NPX_CMD || path.join(path.dirname(NODE), 'npx');
+// npm registry 镜像（默认淘宝源，可外部覆盖）
+const NPM_REGISTRY = process.env.DSH_NPM_REGISTRY || 'https://registry.npmmirror.com';
+// DSH 启动命令。默认走 npx（npm latest，带缓存）；可整条覆盖：
+//   DSH_START_CMD="node /abs/path/to/dsh/lib/bin.js web --port 3080"
 const DSH_START = process.env.DSH_START_CMD
-  || (NODE + ' --import tsx/esm ' + shq(path.join(DSH_DIR, 'apps/cli/src/bin.ts')) + ' web --port ' + DSH_PORT);
+  || (NPX + ' -y ' + NPM_PKG + ' web --port ' + DSH_PORT);
 
-// ---- 版本检查 / 更新 ----
-const REMOTE = process.env.DSH_REMOTE || 'origin';
-const UPDATE_REPO_URL = process.env.DSH_REPO_URL || 'https://github.com/deepseek-ai/deepseek-harness';
-const PACKAGE_REL = 'apps/cli/package.json';
-const FETCH_TIMEOUT = 2 * 60 * 1000;
-const BUILD_TIMEOUT = 10 * 60 * 1000;
+// ---- 版本检查 / 更新（npm registry 模式）----
+const NPM_TIMEOUT = 3 * 60 * 1000;
 
 // ---- 转发状态 ----
 let seq = 0;
@@ -98,69 +99,68 @@ function tail(s, n) {
 }
 
 function git(args, timeout) {
-  return sh('git -C ' + shq(DSH_DIR) + ' ' + args, timeout);
+  // 保留函数签名兼容（不再使用），直接报错提示
+  return Promise.resolve({ code: 1, stdout: '', stderr: 'git mode removed: dsh now runs via npx ' + NPM_PKG });
 }
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
 }
 
-async function getLocalInfo() {
-  const [headR, fullR, branchR, diffR, cachedR] = await Promise.all([
-    git('rev-parse --short HEAD 2>/dev/null'),
-    git('rev-parse HEAD 2>/dev/null'),
-    git('symbolic-ref --short HEAD 2>/dev/null'),
-    git('diff --quiet 2>/dev/null'),
-    git('diff --cached --quiet 2>/dev/null'),
-  ]);
-  const info = {
-    dir: DSH_DIR,
-    commit: trim(fullR.stdout) || null,
-    shortCommit: trim(headR.stdout) || null,
-    branch: trim(branchR.stdout) || 'master',
-    dirty: diffR.code !== 0 || cachedR.code !== 0,
-  };
-  const pkg = readJson(path.join(DSH_DIR, PACKAGE_REL));
-  info.packageVersion = (pkg && pkg.version) || null;
-  return info;
+// 定位 npx 缓存里安装的 dsh 包目录（最新一个）；无则 null
+function findNpxDshDir() {
+  const base = path.join(os.homedir(), '.npm', '_npx');
+  let best = null;
+  let bestMtime = 0;
+  try {
+    for (const entry of fs.readdirSync(base)) {
+      const pkgDir = path.join(base, entry, 'node_modules', NPM_PKG, 'package.json');
+      let st;
+      try { st = fs.statSync(pkgDir); } catch (e) { continue; }
+      if (st.mtimeMs > bestMtime) { bestMtime = st.mtimeMs; best = path.dirname(pkgDir); }
+    }
+  } catch (e) {}
+  return best;
 }
 
-async function getRemoteInfo(branch) {
-  const [shortR, fullR, fileR] = await Promise.all([
-    git('rev-parse --short ' + REMOTE + '/' + branch + ' 2>/dev/null'),
-    git('rev-parse ' + REMOTE + '/' + branch + ' 2>/dev/null'),
-    git('show ' + REMOTE + '/' + branch + ':' + PACKAGE_REL + ' 2>/dev/null'),
-  ]);
-  let pkg = null;
-  try { pkg = JSON.parse(fileR.stdout); } catch (e) {}
+// 当前已安装（npx 缓存里）的 dsh 版本
+async function getLocalInfo() {
+  const dir = findNpxDshDir();
+  let version = null;
+  if (dir) {
+    const pkg = readJson(path.join(dir, 'package.json'));
+    version = (pkg && pkg.version) || null;
+  }
   return {
-    commit: trim(fullR.stdout) || null,
-    shortCommit: trim(shortR.stdout) || null,
-    packageVersion: (pkg && pkg.version) || null,
+    dir: dir || null,
+    packageVersion: version,
+    installMode: 'npx',
   };
+}
+
+// registry 上的最新版本
+async function getRemoteInfo() {
+  const r = await sh(
+    'npm_config_registry=' + shq(NPM_REGISTRY) + ' ' + NPM + ' view ' + NPM_PKG + ' version 2>/dev/null',
+    NPM_TIMEOUT
+  );
+  const version = trim(r.stdout).split('\n').pop() || null;
+  return { packageVersion: version, latestTag: 'latest' };
 }
 
 async function getUpdateInfo(doFetch) {
-  if (doFetch) {
-    const f = await git('fetch ' + REMOTE + ' --prune 2>&1', FETCH_TIMEOUT);
-    if (f.code !== 0) throw new Error('git fetch 失败：' + tail(f.stderr || f.stdout, 2000));
-  }
+  // doFetch 兼容保留：npm view 本身总是实时查 registry
   const current = await getLocalInfo();
-  const branch = current.branch || 'master';
-  const latest = await getRemoteInfo(branch);
-  const behindR = await git('rev-list --count HEAD..' + REMOTE + '/' + branch + ' 2>/dev/null');
-  const aheadR = await git('rev-list --count ' + REMOTE + '/' + branch + '..HEAD 2>/dev/null');
-  const behind = parseInt(trim(behindR.stdout), 10) || 0;
-  const ahead = parseInt(trim(aheadR.stdout), 10) || 0;
+  const latest = await getRemoteInfo();
+  const cur = current.packageVersion;
+  const lat = latest.packageVersion;
+  const hasUpdate = !!cur && !!lat && cur !== lat;
   return {
     ok: true,
-    branch: branch,
     current: current,
     latest: latest,
-    hasUpdate: behind > 0,
-    behind: behind,
-    ahead: ahead,
-    compareUrl: UPDATE_REPO_URL + '/compare/' + encodeURIComponent(current.commit || 'HEAD') + '...' + encodeURIComponent(latest.commit || (REMOTE + '/' + branch)),
+    hasUpdate: hasUpdate,
+    compareUrl: 'https://www.npmjs.com/package/' + NPM_PKG + '?activeTab=versions',
   };
 }
 
@@ -185,14 +185,6 @@ async function readLogTail(file, lines) {
 function appendDetail(line) {
   if (updateState.detail.length >= 300) updateState.detail.shift();
   updateState.detail.push(line);
-}
-
-function pickPkgManager() {
-  const binDir = path.dirname(NODE);
-  const pnpm = path.join(binDir, 'pnpm');
-  const npm = path.join(binDir, 'npm');
-  if (fs.existsSync(pnpm)) return { install: pnpm + ' install', build: pnpm + ' run build' };
-  return { install: npm + ' install', build: npm + ' run build' };
 }
 
 async function currentPid() {
@@ -220,7 +212,7 @@ async function waitFree(secs) {
 // ---- Hindsight 本地 daemon 保活：启动 DSH 前检查 9077，没有则后台拉起并常驻 ----
 function ensureHindsight() {
   const HEALTH = 'http://127.0.0.1:9077/health';
-  const EMBED = process.env.HINDSIGHT_EMBED || path.join(os.homedir(), '.cargo', 'bin', 'hindsight-embed');
+  const EMBED = '/Users/zhe.chen/.cargo/bin/hindsight-embed';
   sh('curl -s -o /dev/null -w "%{http_code}" --max-time 3 ' + HEALTH + ' 2>/dev/null || echo 000')
     .then((r) => {
       if (/^2/.test(String(r.stdout).trim())) return;
@@ -254,7 +246,7 @@ async function startDsh() {
     return null;
   }
   setLifecycle({ state: 'starting', startedAt: new Date().toISOString(), finishedAt: null, step: '启动进程', message: '正在启动 DSH 进程', error: null, log: '' });
-  await sh('cd ' + shq(DSH_DIR) + ' || { echo "cd failed: ' + DSH_DIR + '"; exit 1; }; nohup ' + DSH_START + ' > ' + DSH_LOG + ' 2>&1 < /dev/null &');
+  await sh('nohup ' + DSH_START + ' > ' + DSH_LOG + ' 2>&1 < /dev/null &');
   setLifecycle({ state: 'starting', step: '等待端口', message: '正在等待端口 ' + DSH_PORT + ' 就绪' });
   await sh('for ((i=0;i<150;i++)); do ' + LSOF + ' -ti tcp:' + DSH_PORT + ' -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.2; done');
   const pid = await currentPid();
@@ -331,9 +323,16 @@ async function ctlRestart() {
 
 // ---- 更新流程：拉取 + 保留本地修改 + 重装/重建 ----
 // force=true:跳过版本检查,即使已是最新也重装依赖+重建+重启(修复半损坏的安装)。
+function pickPkgManager() {
+  // npx 模式不再需要 pnpm install + build;保留签名仅为兼容
+  return { install: '', build: '' };
+}
+
+// ---- 更新流程（npx 模式）：清除缓存 → 预热拉取最新 → 重启 ----
+// force=true:跳过版本检查,即使已是最新也重新拉取+重启(修复半损坏的安装)。
 async function runUpdate(force) {
   force = force === true;
-  setUpdate({ state: 'running', startedAt: new Date().toISOString(), finishedAt: null, step: force ? '准备修复/重装' : '准备检查仓库', message: '', error: null, warnings: [], detail: [] });
+  setUpdate({ state: 'running', startedAt: new Date().toISOString(), finishedAt: null, step: force ? '准备修复/重装' : '准备检查版本', message: '', error: null, warnings: [], detail: [] });
   try {
     const info = await getUpdateInfo(true);
     if (!info.ok) throw new Error('无法获取更新信息');
@@ -341,7 +340,7 @@ async function runUpdate(force) {
       setUpdate({ state: 'completed', step: '已是最新', message: '当前已是最新版本，无需更新', finishedAt: new Date().toISOString() });
       return;
     }
-    const doMerge = info.hasUpdate;
+    const doUpdate = info.hasUpdate;
 
     const wasRunning = !!(await currentPid());
     if (wasRunning) {
@@ -350,50 +349,31 @@ async function runUpdate(force) {
       await waitFree(5);
     }
 
-    // 只暂存“已跟踪文件”的本地修改；未跟踪的本地插件/构建产物原样保留。
-    let stashed = false;
-    if (doMerge) {
-      const diffR = await git('diff --quiet 2>/dev/null');
-      const cachedR = await git('diff --cached --quiet 2>/dev/null');
-      if (diffR.code !== 0 || cachedR.code !== 0) {
-        setUpdate({ step: '暂存本地修改', message: '更新前暂存本地已跟踪修改，完成后自动恢复' });
-        const stashName = 'dsh-update-auto-' + Date.now();
-        const sr = await git('stash push -m ' + shq(stashName) + ' --quiet', 60000);
-        if (sr.code !== 0) throw new Error('暂存本地修改失败（未执行更新，原文件未动）：' + tail(sr.stderr || sr.stdout, 2000));
-        stashed = true;
-        appendDetail('stash: ' + stashName);
-      }
-
-      setUpdate({ step: '拉取远端更新', message: '正在从 ' + REMOTE + '/' + info.branch + ' 拉取' });
-      const mr = await git('merge --ff-only ' + REMOTE + '/' + info.branch + ' 2>&1', FETCH_TIMEOUT);
-      if (mr.code !== 0) {
-        if (stashed) {
-          setUpdate({ step: '拉取失败，恢复本地修改', message: '更新失败，正在恢复本地修改' });
-          await git('stash pop 2>&1', 60000);
-        }
-        throw new Error('拉取更新失败（本地修改已保留）：' + tail(mr.stderr || mr.stdout, 2000));
-      }
-      appendDetail('merge ok');
-
-      if (stashed) {
-        setUpdate({ step: '恢复本地修改', message: '正在恢复更新前暂存的本地修改' });
-        const pr = await git('stash pop 2>&1', 60000);
-        if (pr.code !== 0) {
-          updateState.warnings.push('拉取成功，但自动恢复本地修改时出现冲突，本地修改已保留在工作区，请手动处理：git stash list');
-          appendDetail('stash pop warning: ' + tail(pr.stderr || pr.stdout, 2000));
-          throw new Error('拉取完成，但恢复本地修改时出现冲突（本地修改已保留，未覆盖）；请手动解决冲突后重新构建。');
+    // 清除 npx 缓存里该包的所有副本,强制下次 npx 重新拉取
+    setUpdate({ step: '清除 npx 缓存', message: '正在清除 ' + NPM_PKG + ' 的 npx 缓存' });
+    const cacheBase = path.join(os.homedir(), '.npm', '_npx');
+    let cleared = 0;
+    try {
+      for (const entry of fs.readdirSync(cacheBase)) {
+        const pkgDir = path.join(cacheBase, entry, 'node_modules', NPM_PKG);
+        if (fs.existsSync(pkgDir)) {
+          fs.rmSync(pkgDir, { recursive: true, force: true });
+          cleared++;
+          appendDetail('cleared: ' + pkgDir);
         }
       }
+    } catch (e) {
+      updateState.warnings.push('清除 npx 缓存失败（可手动删除 ~/.npm/_npx 下 ' + NPM_PKG + ' 目录）：' + String((e && e.message) || e));
     }
+    appendDetail('npx cache cleared: ' + cleared + ' copy(ies)');
 
-    const pkgm = pickPkgManager();
-    setUpdate({ step: '安装依赖', message: '正在安装/更新 DSH 依赖' });
-    const ir = await sh('cd ' + shq(DSH_DIR) + ' && ' + pkgm.install + ' 2>&1', BUILD_TIMEOUT);
-    if (ir.code !== 0) throw new Error('依赖安装失败：' + tail(ir.stderr || ir.stdout, 3000));
-
-    setUpdate({ step: '重新构建 DSH', message: '正在重新构建（可能需要几分钟）' });
-    const br = await sh('cd ' + shq(DSH_DIR) + ' && ' + pkgm.build + ' 2>&1', BUILD_TIMEOUT);
-    if (br.code !== 0) throw new Error('构建失败：' + tail(br.stderr || br.stdout, 3000));
+    // 预热:强制解析 registry 最新版并下载(验证包可拉取)
+    setUpdate({ step: '拉取最新版本', message: '正在从 npm registry 拉取 ' + NPM_PKG + (doUpdate ? ' 最新版 ' + info.latest.packageVersion : '') });
+    const warm = await sh(
+      'npm_config_registry=' + shq(NPM_REGISTRY) + ' ' + NPX + ' -y ' + NPM_PKG + ' --version 2>&1',
+      NPM_TIMEOUT
+    );
+    if (warm.code !== 0) throw new Error('拉取 ' + NPM_PKG + ' 失败：' + tail(warm.stderr || warm.stdout, 2000));
 
     if (wasRunning || force) {
       setUpdate({ step: '重新启动 DSH', message: '正在重新启动 DSH 服务' });
@@ -403,7 +383,7 @@ async function runUpdate(force) {
     setUpdate({
       state: 'completed',
       step: '完成',
-      message: doMerge ? 'DSH 已更新并重新构建，本地插件/设置已保留' : 'DSH 已重装依赖并重新构建',
+      message: doUpdate ? 'DSH 已更新到 ' + info.latest.packageVersion + '（npx 缓存已刷新）' : 'DSH 已重装并重启',
       finishedAt: new Date().toISOString(),
     });
   } catch (e) {
@@ -411,7 +391,7 @@ async function runUpdate(force) {
       state: 'failed',
       step: '失败',
       error: String((e && e.message) || e),
-      message: '更新失败，本地文件未被覆盖',
+      message: '更新失败，本地配置未被覆盖',
       finishedAt: new Date().toISOString(),
     });
   } finally {
