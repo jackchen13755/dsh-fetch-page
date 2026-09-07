@@ -178,11 +178,6 @@ zentao_resolve_bug bugID=1234 \\
 - `force`：当前已是「已解决」时仍强制再次解决
 - `dryRun`：只解析并返回提交字段，不真正提交
 
-兜底策略：MCP 提交未生效（状态仍非「已解决」）或 MCP 流程异常时，会自动调用系统
-CLI `~/.local/bin/zentao-resolve-bug` 进行兜底解决；CLI 也未生效时会在返回信息里
-说明，不会静默失败。无论成功与否，返回的 `url` 都指向 Bug 详情页。
-
-
 ### 验证开发结果
 
 `browser-plugin` 提供 `verify_page` 工具：打开真实 Chrome 页面，按 JSON 断言契约校验

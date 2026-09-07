@@ -13,7 +13,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ShellRunResult } from '@deepseek-ai/dsh-shell'
-import { spawnSync } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -149,42 +148,6 @@ function resolveBuildId(build: string, options: SelectOption[]): string {
   const byText = options.find(o => o.text === raw || o.title === raw)
   if (byText) return byText.value
   return raw
-}
-
-/** MCP 提交未生效时，调用系统 CLI（~/.local/bin/zentao-resolve-bug）做兜底。 */
-function runCliFallback(base: string, bugID: string, a: any): {
-  ok: boolean
-  bugID: string
-  status: string
-  message: string
-  url: string
-  body?: string
-  error?: string
-} {
-  const cli = process.env.ZENTAO_RESOLVE_CLI || join(homedir(), '.local', 'bin', 'zentao-resolve-bug')
-  const args = [String(bugID)]
-  if (a.resolution !== undefined && a.resolution !== null && a.resolution !== '') args.push('-r', String(a.resolution))
-  if (a.reason !== undefined && a.reason !== null && a.reason !== '') args.push('--reason', String(a.reason))
-  if (a.build !== undefined && a.build !== null && a.build !== '') args.push('-b', String(a.build))
-  if (a.comment !== undefined && a.comment !== null && a.comment !== '') args.push('-c', String(a.comment))
-  if (a.detail !== undefined && a.detail !== null && a.detail !== '') args.push('-d', String(a.detail))
-  if (a.impact !== undefined && a.impact !== null && a.impact !== '') args.push('-i', String(a.impact))
-  if (a.assignedTo !== undefined && a.assignedTo !== null && a.assignedTo !== '') args.push('--assigned-to', String(a.assignedTo))
-  if (a.inChargedBy !== undefined && a.inChargedBy !== null && a.inChargedBy !== '') args.push('--incharged-by', String(a.inChargedBy))
-  if (a.force) args.push('-f')
-  const url = `${base}/index.php?m=bug&f=view&bugID=${bugID}`
-  let r
-  try {
-    r = spawnSync(cli, args, { encoding: 'utf8', timeout: 120000 })
-  } catch (e) {
-    return { ok: false, bugID: String(bugID), status: '', message: `CLI 兜底启动失败：${e instanceof Error ? e.message : String(e)}`, url, error: e instanceof Error ? e.message : String(e) }
-  }
-  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim()
-  const success = r.status === 0 && /已解决/.test(out)
-  if (success) {
-    return { ok: true, bugID: String(bugID), status: '已解决', message: out, url }
-  }
-  return { ok: false, bugID: String(bugID), status: '', message: `CLI 兜底未生效：${out || 'exit ' + r.status}`, url, body: out }
 }
 
 function inputValue(html: string, name: string): string {
@@ -361,7 +324,7 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   ctx.tools.register(defineTool({
     name: 'zentao_resolve_bug',
-    description: '通过浏览器插件桥接解决禅道 Bug（zen.sgrl.io）：复用 fetch_page 的浏览器转发链路，读取当前登录态的详情/解决表单、解析 uid 与默认值、标注必填项，并提交解决。无需读取 Chrome Cookie。若 MCP 提交未生效，会自动调用系统 CLI（~/.local/bin/zentao-resolve-bug）兜底。',
+    description: '通过浏览器插件桥接解决禅道 Bug（zen.sgrl.io）：复用 fetch_page 的浏览器转发链路，读取当前登录态的详情/解决表单、解析 uid 与默认值、标注必填项，并提交解决。无需读取 Chrome Cookie。',
     parameters: {
       bugID: { type: 'string', required: true, description: '禅道 Bug ID（必填）' },
       resolution: { type: 'string', enum: ['bydesign', 'duplicate', 'external', 'fixed', 'notrepro', 'postponed', 'willnotfix'], description: '解决方案，默认 fixed' },
@@ -431,7 +394,7 @@ export function apply(ctx: Context, config: Config = {}): void {
           return { ok: true, bugID, status, message: '当前已是已解决，无需操作；如需再次解决请加 force=true', url: viewUrl }
         }
 
-        // MCP 提交逻辑独立成一次调用，便于未生效时再走 CLI 兜底。
+        // 解析解决表单并完成一次提交。
         const submitOnce = async (): Promise<any> => {
           const formResp = await forward('GET', formUrl)
           maybeThrow(formResp, '获取解决表单失败')
@@ -483,29 +446,8 @@ export function apply(ctx: Context, config: Config = {}): void {
           return { ok: false, bugID, status: afterStatus || '未知', message: '提交完成但状态校验异常，请打开页面确认', url: viewUrl, body: String(postResp.body ?? '').slice(0, 500) }
         }
 
-        const mcpResult = await submitOnce()
-        if (mcpResult.dryRun) return mcpResult
-        if (mcpResult.ok) return mcpResult
-
-        // MCP 未生效，走 CLI 兜底。若 MCP 已把解决版本映射成 option value，则传给 CLI 用该 ID。
-        const mcpBuildField = Array.isArray(mcpResult.fields) ? mcpResult.fields.find(([k]: [string, string]) => k === 'resolvedBuild') as [string, string] | undefined : undefined
-        if (mcpBuildField?.[1]) a.build = mcpBuildField[1]
-        const cliResult = runCliFallback(base, bugID, a)
-        if (cliResult.ok) {
-          return { ok: true, bugID, status: cliResult.status, message: `MCP 提交未生效，已用 CLI 兜底解决。\n${cliResult.message}`, url: viewUrl, fields: mcpResult.fields, required: mcpResult.required, missingRequired: mcpResult.missingRequired }
-        }
-        return { ok: false, bugID, status: mcpResult.status || '未知', message: `MCP 提交完成但状态校验异常，CLI 兜底也未生效。\n${cliResult.message}`, url: viewUrl, body: mcpResult.body, error: cliResult.error }
+        return await submitOnce()
       } catch (e) {
-        // MCP 流程异常时也尝试 CLI 兜底（例如浏览器会话异常导致 MCP 解析/提交失败）。
-        const bugID = String((args as any).bugID ?? '')
-        if (bugID) {
-          const base = process.env.ZENTAO_BASE || 'https://zen.sgrl.io'
-          const cliResult = runCliFallback(base, bugID, a)
-          if (cliResult.ok) {
-            return { ok: true, bugID, status: cliResult.status, message: `MCP 异常后已用 CLI 兜底解决。\n${cliResult.message}`, url: `${base}/index.php?m=bug&f=view&bugID=${bugID}` }
-          }
-          return { error: e instanceof Error ? e.message : String(e), fallback: cliResult.message }
-        }
         return { error: e instanceof Error ? e.message : String(e) }
       }
     },
