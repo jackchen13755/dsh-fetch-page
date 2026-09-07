@@ -172,11 +172,16 @@ zentao_resolve_bug bugID=1234 \\
 - `bugID`：必填，禅道 Bug ID
 - `resolution`：解决方案，默认 `fixed`（`bydesign`/`duplicate`/`external`/`fixed`/`notrepro`/`postponed`/`willnotfix`）
 - `reason`：Bug 产生原因，默认 `codeBug`
-- `build`：解决版本 build ID；缺省自动取该 Bug 最近一次解决版本，其次取解决表单默认 `resolvedBuild`
+- `build`：解决版本 build ID 或显示名称；会自动从解决表单的 `resolvedBuild` 下拉里查找匹配的 option value（ID），如 `xx.` → `6780`。缺省自动取该 Bug 最近一次解决版本并做同样的 ID 映射，其次取解决表单默认 `resolvedBuild`
 - `comment` / `detail` / `impact`：备注 / bug 详细原因 / 代码变更影响范围
 - `assignedTo` / `inChargedBy`：指派给 / Bug 所属人（`inChargedBy` 在该实例为必填，建议显式指定）
 - `force`：当前已是「已解决」时仍强制再次解决
 - `dryRun`：只解析并返回提交字段，不真正提交
+
+兜底策略：MCP 提交未生效（状态仍非「已解决」）或 MCP 流程异常时，会自动调用系统
+CLI `~/.local/bin/zentao-resolve-bug` 进行兜底解决；CLI 也未生效时会在返回信息里
+说明，不会静默失败。无论成功与否，返回的 `url` 都指向 Bug 详情页。
+
 
 ### 验证开发结果
 
