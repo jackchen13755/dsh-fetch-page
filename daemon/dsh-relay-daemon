@@ -28,9 +28,17 @@ const NPM_REGISTRY = process.env.DSH_NPM_REGISTRY || 'https://registry.npmmirror
 //   DSH_START_CMD="node /abs/path/to/dsh/lib/bin.js web --port 3080"
 const DSH_START = process.env.DSH_START_CMD
   || (NPX + ' -y ' + NPM_PKG + ' web --port ' + DSH_PORT);
+// 预发布版钉住记录（原地安装预发布版时写入；回到 latest 通道后清除）。
+// 有 pin 且版本与已安装一致时改用「直启已安装副本」：npx 对裸包名总会回查 registry 解析 latest
+// （libnpmexec: npxByNameOnly 分支），会把原地装的预发布版打回去。
+const PIN_FILE = process.env.DSH_PIN_FILE || path.join(os.homedir(), '.dsh', 'dsh-relay-daemon-pin.json');
 
 // ---- 版本检查 / 更新（npm registry 模式）----
 const NPM_TIMEOUT = 3 * 60 * 1000;
+// 版本通道（读 dist-tags）：
+//   auto(默认) = 有正式版跟 latest 通道；尚无正式版则取最高版本（可能为预发布）
+//   latest | next | alpha | newest | 任意 dist-tag 名 = 固定跟随该通道
+const UPDATE_CHANNEL = String(process.env.DSH_UPDATE_CHANNEL || 'auto').toLowerCase();
 
 // ---- 转发状态 ----
 let seq = 0;
@@ -108,8 +116,14 @@ function readJson(file) {
 }
 
 // 定位 npx 缓存里安装的 dsh 包目录（最新一个）；无则 null
+// npx 缓存根：跟随 npm 的 cache 配置（默认 ~/.npm/_npx）
+function npxCacheBase() {
+  const cacheRoot = process.env.npm_config_cache || path.join(os.homedir(), '.npm');
+  return path.join(cacheRoot, '_npx');
+}
+
 function findNpxDshDir() {
-  const base = path.join(os.homedir(), '.npm', '_npx');
+  const base = npxCacheBase();
   let best = null;
   let bestMtime = 0;
   try {
@@ -138,14 +152,158 @@ async function getLocalInfo() {
   };
 }
 
-// registry 上的最新版本
-async function getRemoteInfo() {
+// 在既有 _npx 目录内原地安装指定版本：
+// 同一目录 → profile 的 @deepseek-ai/* 软链与 host 同源（避免新建第二个 _npx 目录造成 host/插件版本错配）
+async function installVersionInPlace(version, npxDirHint) {
+  let npxDir = npxDirHint || null;
+  if (!npxDir) {
+    const pkgDir = findNpxDshDir();
+    if (pkgDir) npxDir = path.dirname(path.dirname(pkgDir)); // .../_npx/<hash>
+  }
+  if (!npxDir || !fs.existsSync(npxDir)) throw new Error('未找到 npx 缓存中的 ' + NPM_PKG + ' 安装目录，无法原地安装');
   const r = await sh(
-    'npm_config_registry=' + shq(NPM_REGISTRY) + ' ' + NPM + ' view ' + NPM_PKG + ' version 2>/dev/null',
+    'cd ' + shq(npxDir) + ' && npm_config_registry=' + shq(NPM_REGISTRY) + ' ' + NPM +
+      ' install ' + NPM_PKG + '@' + version + ' --no-audit --no-fund 2>&1',
     NPM_TIMEOUT
   );
-  const version = trim(r.stdout).split('\n').pop() || null;
-  return { packageVersion: version, latestTag: 'latest' };
+  if (r.code !== 0) throw new Error('原地安装 ' + NPM_PKG + '@' + version + ' 失败：' + tail(r.stdout || r.stderr, 2000));
+  return npxDir;
+}
+
+// ---- 预发布钉住（pin）----
+function readPin() {
+  const j = readJson(PIN_FILE);
+  return j && typeof j.version === 'string' && j.version ? { version: j.version, at: j.at || null } : null;
+}
+
+function writePin(version) {
+  try {
+    fs.mkdirSync(path.dirname(PIN_FILE), { recursive: true });
+    fs.writeFileSync(PIN_FILE, JSON.stringify({ version: version, at: new Date().toISOString() }, null, 1));
+    appendDetail('pin: ' + version + ' (' + PIN_FILE + ')');
+  } catch (e) {
+    updateState.warnings.push('写入 pin 失败（下次启动可能回退到 latest）：' + String((e && e.message) || e));
+  }
+}
+
+function clearPin() {
+  try {
+    if (fs.existsSync(PIN_FILE)) { fs.rmSync(PIN_FILE, { force: true }); appendDetail('pin cleared: ' + PIN_FILE); }
+  } catch (e) {}
+}
+
+// 启动 DSH 的命令：显式 DSH_START_CMD > 有 pin 且与已安装版本一致（直启该副本，避免 npx 回退 latest）> 裸 spec
+async function dshStartCommand() {
+  if (process.env.DSH_START_CMD) return DSH_START;
+  const pin = readPin();
+  if (pin) {
+    const cur = await getLocalInfo();
+    const bin = cur.dir ? path.join(cur.dir, 'lib', 'bin.js') : null;
+    if (cur.packageVersion && cur.packageVersion === pin.version && bin && fs.existsSync(bin)) {
+      return NODE + ' ' + shq(bin) + ' web --port ' + DSH_PORT;
+    }
+    clearPin(); // pin 过期（安装已被覆盖或目录缺失）→ 回到裸 spec
+  }
+  return DSH_START;
+}
+
+// ---- 版本比较（semver 子集:x.y.z 与 x.y.z-pre.n 足够本场景）----
+function parseVer(v) {
+  const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/.exec(String(v || '').trim());
+  if (!m) return null;
+  return { core: [Number(m[1]), Number(m[2]), Number(m[3])], pre: m[4] ? m[4].split('.') : [] };
+}
+
+function cmpVer(a, b) {
+  const x = parseVer(a);
+  const y = parseVer(b);
+  if (!x || !y) return 0;
+  for (let i = 0; i < 3; i++) {
+    if (x.core[i] !== y.core[i]) return x.core[i] < y.core[i] ? -1 : 1;
+  }
+  if (!x.pre.length || !y.pre.length) {
+    if (!x.pre.length && !y.pre.length) return 0;
+    return x.pre.length ? -1 : 1; // 预发布 < 正式版
+  }
+  const n = Math.max(x.pre.length, y.pre.length);
+  for (let i = 0; i < n; i++) {
+    const p = x.pre[i];
+    const q = y.pre[i];
+    if (p === undefined) return -1;
+    if (q === undefined) return 1;
+    const pn = /^\d+$/.test(p);
+    const qn = /^\d+$/.test(q);
+    if (pn && qn) {
+      if (Number(p) !== Number(q)) return Number(p) < Number(q) ? -1 : 1;
+    } else if (pn !== qn) {
+      return pn ? -1 : 1; // 数字标识符 < 字母标识符
+    } else if (p !== q) {
+      return p < q ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+function isPre(v) {
+  const p = parseVer(v);
+  return !!p && p.pre.length > 0;
+}
+
+// registry 上的最新版本（通道感知：读 dist-tags + 版本列表，不再只看 latest 单个 tag）
+async function getRemoteInfo() {
+  let doc = null;
+  try {
+    const r = await sh(
+      'npm_config_registry=' + shq(NPM_REGISTRY) + ' ' + NPM + ' view ' + NPM_PKG + ' dist-tags versions --json 2>/dev/null',
+      NPM_TIMEOUT
+    );
+    doc = JSON.parse(trim(r.stdout) || 'null');
+  } catch (e) {
+    doc = null;
+  }
+  const tags = (doc && doc['dist-tags']) || {};
+  const versions = Array.isArray(doc && doc.versions) ? doc.versions.slice() : [];
+  if (!versions.length) {
+    // 兜底：老命令（只取 latest tag 指向的版本），并标注未能读取通道
+    const r = await sh(
+      'npm_config_registry=' + shq(NPM_REGISTRY) + ' ' + NPM + ' view ' + NPM_PKG + ' version 2>/dev/null',
+      NPM_TIMEOUT
+    );
+    const version = trim(r.stdout).split('\n').pop() || null;
+    return {
+      packageVersion: version,
+      latestTag: 'latest',
+      channel: 'latest',
+      channels: {},
+      newest: version,
+      hasStable: false,
+      prerelease: isPre(version),
+      channelsUnavailable: true,
+    };
+  }
+  const hasStable = versions.some((v) => !isPre(v));
+  const newest = versions.sort((a, b) => cmpVer(b, a))[0];
+  let channel = UPDATE_CHANNEL;
+  let version = null;
+  if (channel !== 'auto') {
+    version = channel === 'newest' ? newest : tags[channel] || null;
+  } else if (hasStable) {
+    channel = 'latest'; // 有正式版：跟随 latest 通道
+    version = tags.latest || null;
+  } else {
+    channel = 'newest'; // 尚无正式版：取最高版本（可能为预发布）
+    version = newest;
+  }
+  return {
+    packageVersion: version,
+    latestTag: channel,
+    channel: channel,
+    channels: tags,
+    newest: newest,
+    hasStable: hasStable,
+    prerelease: isPre(version),
+    channelMissing: !version,
+  };
 }
 
 async function getUpdateInfo(doFetch) {
@@ -154,11 +312,23 @@ async function getUpdateInfo(doFetch) {
   const latest = await getRemoteInfo();
   const cur = current.packageVersion;
   const lat = latest.packageVersion;
-  const hasUpdate = !!cur && !!lat && cur !== lat;
+  // 只在确有更高版本时报更新（旧逻辑用字符串不等，会把降级也误报成更新）
+  const hasUpdate = !!cur && !!lat && cmpVer(cur, lat) < 0;
+  const prerelease = !!latest.prerelease;
   return {
     ok: true,
     current: current,
     latest: latest,
+    channels: latest.channels || {},
+    newest: latest.newest || null,
+    hasStable: !!latest.hasStable,
+    prerelease: prerelease,
+    // 预发布目标不能走自动更新：安装链路是 latest tag + 裸 spec 启动
+    autoUpdateSupported: !prerelease,
+    // 目标为预发布时，需要显式开关（POST /update?allowPrerelease=1）才会安装
+    requiresOptIn: prerelease,
+    pinned: readPin(),
+    startCommand: await dshStartCommand(),
     hasUpdate: hasUpdate,
     compareUrl: 'https://www.npmjs.com/package/' + NPM_PKG + '?activeTab=versions',
   };
@@ -212,7 +382,7 @@ async function waitFree(secs) {
 // ---- Hindsight 本地 daemon 保活：启动 DSH 前检查 9077，没有则后台拉起并常驻 ----
 function ensureHindsight() {
   const HEALTH = 'http://127.0.0.1:9077/health';
-  const EMBED = '/Users/zhe.chen/.cargo/bin/hindsight-embed';
+  const EMBED = process.env.DSH_HINDSIGHT_EMBED || path.join(os.homedir(), '.cargo', 'bin', 'hindsight-embed');
   sh('curl -s -o /dev/null -w "%{http_code}" --max-time 3 ' + HEALTH + ' 2>/dev/null || echo 000')
     .then((r) => {
       if (/^2/.test(String(r.stdout).trim())) return;
@@ -246,7 +416,7 @@ async function startDsh() {
     return null;
   }
   setLifecycle({ state: 'starting', startedAt: new Date().toISOString(), finishedAt: null, step: '启动进程', message: '正在启动 DSH 进程', error: null, log: '' });
-  await sh('nohup ' + DSH_START + ' > ' + DSH_LOG + ' 2>&1 < /dev/null &');
+  await sh('nohup ' + (await dshStartCommand()) + ' > ' + DSH_LOG + ' 2>&1 < /dev/null &');
   setLifecycle({ state: 'starting', step: '等待端口', message: '正在等待端口 ' + DSH_PORT + ' 就绪' });
   await sh('for ((i=0;i<150;i++)); do ' + LSOF + ' -ti tcp:' + DSH_PORT + ' -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.2; done');
   const pid = await currentPid();
@@ -329,9 +499,12 @@ function pickPkgManager() {
 }
 
 // ---- 更新流程（npx 模式）：清除缓存 → 预热拉取最新 → 重启 ----
+// 预发布目标（alpha/next 或尚无正式版时的最高版本）默认拒绝，需 opts.allowPrerelease
+// （POST /update?allowPrerelease=1）；该分支改为在既有 _npx 目录内原地安装，避免版本错配。
 // force=true:跳过版本检查,即使已是最新也重新拉取+重启(修复半损坏的安装)。
-async function runUpdate(force) {
+async function runUpdate(force, opts) {
   force = force === true;
+  const allowPre = !!(opts && opts.allowPrerelease);
   setUpdate({ state: 'running', startedAt: new Date().toISOString(), finishedAt: null, step: force ? '准备修复/重装' : '准备检查版本', message: '', error: null, warnings: [], detail: [] });
   try {
     const info = await getUpdateInfo(true);
@@ -340,7 +513,23 @@ async function runUpdate(force) {
       setUpdate({ state: 'completed', step: '已是最新', message: '当前已是最新版本，无需更新', finishedAt: new Date().toISOString() });
       return;
     }
+    // 预发布目标（alpha/next 通道，或尚无正式版时 registry 上的最高版本）默认不安装，需显式开关：
+    // 勾选「允许预发布版」(POST /update?allowPrerelease=1) 才走原地安装。
+    if (info.hasUpdate && info.prerelease && !allowPre && !force) {
+      throw new Error(
+        'registry 上更高的版本 ' + info.latest.packageVersion + ' 属预发布通道（' + info.latest.latestTag + '），默认不自动安装预发布版。' +
+        '如需安装，请在扩展弹窗勾选「允许预发布版」后重试（等价于 POST /update?allowPrerelease=1），或等待正式版发布。'
+      );
+    }
     const doUpdate = info.hasUpdate;
+    const preInstall = doUpdate && info.prerelease && allowPre;
+    // 原地安装要在清缓存之前先记下 _npx 目录：清缓存会删掉 findNpxDshDir() 的探测依据
+    let inPlaceDirHint = null;
+    if (preInstall) {
+      const pkgDir = findNpxDshDir();
+      inPlaceDirHint = pkgDir ? path.dirname(path.dirname(pkgDir)) : null;
+      if (!inPlaceDirHint) throw new Error('未找到 npx 缓存中的 ' + NPM_PKG + ' 安装目录，无法原地安装预发布版');
+    }
 
     const wasRunning = !!(await currentPid());
     if (wasRunning) {
@@ -351,7 +540,7 @@ async function runUpdate(force) {
 
     // 清除 npx 缓存里该包的所有副本,强制下次 npx 重新拉取
     setUpdate({ step: '清除 npx 缓存', message: '正在清除 ' + NPM_PKG + ' 的 npx 缓存' });
-    const cacheBase = path.join(os.homedir(), '.npm', '_npx');
+    const cacheBase = npxCacheBase();
     let cleared = 0;
     try {
       for (const entry of fs.readdirSync(cacheBase)) {
@@ -367,13 +556,25 @@ async function runUpdate(force) {
     }
     appendDetail('npx cache cleared: ' + cleared + ' copy(ies)');
 
-    // 预热:强制解析 registry 最新版并下载(验证包可拉取)
-    setUpdate({ step: '拉取最新版本', message: '正在从 npm registry 拉取 ' + NPM_PKG + (doUpdate ? ' 最新版 ' + info.latest.packageVersion : '') });
-    const warm = await sh(
-      'npm_config_registry=' + shq(NPM_REGISTRY) + ' ' + NPX + ' -y ' + NPM_PKG + ' --version 2>&1',
-      NPM_TIMEOUT
-    );
-    if (warm.code !== 0) throw new Error('拉取 ' + NPM_PKG + ' 失败：' + tail(warm.stderr || warm.stdout, 2000));
+    let installedVersion = null;
+    if (preInstall) {
+      // 预发布版:在既有 _npx 目录内原地安装指定版本,保持 host 与插件树同源(不新建第二个 _npx 目录)
+      setUpdate({ step: '安装预发布版', message: '正在原地安装 ' + NPM_PKG + '@' + info.latest.packageVersion });
+      const inPlaceDir = await installVersionInPlace(info.latest.packageVersion, inPlaceDirHint);
+      installedVersion = info.latest.packageVersion;
+      appendDetail('in-place install: ' + NPM_PKG + '@' + installedVersion + ' @ ' + inPlaceDir);
+      writePin(installedVersion); // 钉住：npx 裸 spec 会回查 latest 把它打回去，启动改走直启副本
+    } else {
+      // 常规通道：撤掉预发布钉住，回到裸 spec 启动（/repair 也走这里 = 回到 latest 通道）
+      clearPin();
+      // 预热:强制解析 registry 最新版并下载(验证包可拉取)
+      setUpdate({ step: '拉取最新版本', message: '正在从 npm registry 拉取 ' + NPM_PKG + (doUpdate ? ' 最新版 ' + info.latest.packageVersion : '') });
+      const warm = await sh(
+        'npm_config_registry=' + shq(NPM_REGISTRY) + ' ' + NPX + ' -y ' + NPM_PKG + ' --version 2>&1',
+        NPM_TIMEOUT
+      );
+      if (warm.code !== 0) throw new Error('拉取 ' + NPM_PKG + ' 失败：' + tail(warm.stderr || warm.stdout, 2000));
+    }
 
     if (wasRunning || force) {
       setUpdate({ step: '重新启动 DSH', message: '正在重新启动 DSH 服务' });
@@ -383,7 +584,11 @@ async function runUpdate(force) {
     setUpdate({
       state: 'completed',
       step: '完成',
-      message: doUpdate ? 'DSH 已更新到 ' + info.latest.packageVersion + '（npx 缓存已刷新）' : 'DSH 已重装并重启',
+      message: doUpdate
+        ? (preInstall
+          ? 'DSH 已安装预发布版 ' + installedVersion + '（原地安装，未新建 npx 目录）'
+          : 'DSH 已更新到 ' + info.latest.packageVersion + '（npx 缓存已刷新）')
+        : 'DSH 已重装并重启',
       finishedAt: new Date().toISOString(),
     });
   } catch (e) {
@@ -435,9 +640,10 @@ const server = http.createServer(async function (req, res) {
     if (updating) { respond(res, { ok: false, error: '已有更新任务正在执行', state: updateState.state }); return; }
     const u = new URL(req.url, 'http://localhost');
     const force = req.url.startsWith('/repair') || u.searchParams.get('force') === '1' || u.searchParams.get('force') === 'true';
+    const allowPrerelease = u.searchParams.get('allowPrerelease') === '1' || u.searchParams.get('allowPrerelease') === 'true';
     updating = true;
-    runUpdate(force);
-    respond(res, { ok: true, started: true, state: 'running', force: force });
+    runUpdate(force, { allowPrerelease: allowPrerelease });
+    respond(res, { ok: true, started: true, state: 'running', force: force, allowPrerelease: allowPrerelease });
     return;
   }
 
