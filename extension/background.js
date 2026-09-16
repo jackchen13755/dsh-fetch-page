@@ -271,7 +271,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case 'getVersionInfo': return versionInfo || { ok: false, error: '尚未检查更新' };
       case 'checkUpdate': return checkForUpdates(true);
       case 'checkUpdateSilent': return checkForUpdates(false);
-      case 'startUpdate': return startUpdate();
+      case 'startUpdate': return startUpdate(msg.allowPrerelease === true);
       case 'getUpdateStatus': return getUpdateStatus();
     }
   };
@@ -364,10 +364,11 @@ async function getUpdateStatus() {
   }
 }
 
-async function startUpdate() {
+async function startUpdate(allowPrerelease) {
   let r;
   try {
-    r = await (await fetch(BASE + '/update', { method: 'POST', signal: AbortSignal.timeout(10000) })).json();
+    const url = BASE + '/update' + (allowPrerelease === true ? '?allowPrerelease=1' : '');
+    r = await (await fetch(url, { method: 'POST', signal: AbortSignal.timeout(10000) })).json();
   } catch (e) {
     const failed = { ok: false, error: '无法连接本地守护进程' };
     notify('更新失败', failed.error, false);

@@ -261,6 +261,7 @@ async function doStop() {
 let updateBusy = false;
 let updateAvailable = false;
 let updatePollTimer = null;
+let latestIsPre = false;
 
 function formatVersion(v) {
   if (!v) return '—';
@@ -285,14 +286,17 @@ function renderVersion(info) {
     $('updateStatus').textContent = msg || '';
     $('updateStatus').className = 'version-status' + (err ? ' err' : '');
     updateAvailable = false;
+    latestIsPre = false;
     setUpdateBusy(updateBusy);
     return;
   }
   updateAvailable = !!info.hasUpdate;
+  latestIsPre = !!info.prerelease;
   $('versionCurrent').textContent = '当前版本：' + formatVersion(info.current);
-  $('versionLatest').textContent = '最新版本：' + formatVersion(info.latest);
+  $('versionLatest').textContent = '最新版本：' + formatVersion(info.latest) + (latestIsPre ? '（预发布）' : '');
   if (info.hasUpdate) {
-    $('updateStatus').textContent = '发现新版本 ' + formatVersion(info.latest);
+    $('updateStatus').textContent = '发现新版本 ' + formatVersion(info.latest)
+      + (latestIsPre ? '（预发布，需勾选「允许预发布版」后更新）' : '');
     $('updateStatus').className = 'version-status has-update';
   } else {
     $('updateStatus').textContent = '当前已是最新版本';
@@ -367,11 +371,15 @@ function stopUpdatePolling() {
 
 async function doStartUpdate() {
   if (updateBusy || !updateAvailable) return;
-  if (!window.confirm('将停止 DSH、拉取最新版本并重新构建（本地插件/设置保留）。确定继续？')) return;
+  const allowPre = $('chkAllowPre') ? $('chkAllowPre').checked : false;
+  const tip = allowPre
+    ? '将停止 DSH、安装预发布版（alpha/rc）并重启（本地插件/设置保留）。确定继续？'
+    : '将停止 DSH、拉取最新版本并重新构建（本地插件/设置保留）。确定继续？';
+  if (!window.confirm(tip)) return;
   setUpdateBusy(true);
   $('updateStatus').textContent = '正在提交更新任务…';
   $('updateStatus').className = 'version-status busy';
-  const r = await send({ type: 'startUpdate' });
+  const r = await send({ type: 'startUpdate', allowPrerelease: allowPre });
   if (r && r.ok) {
     pollUpdateStatus();
   } else {
