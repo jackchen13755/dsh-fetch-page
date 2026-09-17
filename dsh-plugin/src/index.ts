@@ -65,8 +65,16 @@ function clampInt(value: unknown, fallback: number, min: number, max: number): n
 }
 
 // ---- 禅道解决 Bug 常用解析辅助 ----
+/**
+ * 判断转发回来的页面是否处于「已登录」状态。
+ * 不能用「页面里出现 m=user&f=login」判断：禅道在请求不带 Referer 时，即使已登录
+ * 也会渲染指向该地址的「返回」按钮（index.php?m=user&f=login&referer=...），
+ * 会把正常页面误判成登录页并直接抛错。改为只认登录表单本身（账号 + 密码输入框）。
+ */
 function isLoggedIn(html: string): boolean {
-  return !/m=user&f=login/.test(html)
+  const hasAccount = /name=['"]?account['"]?[\s>]/.test(html)
+  const hasPassword = /name=['"]?password['"]?[\s>]/.test(html)
+  return !(hasAccount && hasPassword)
 }
 
 function currentStatus(html: string): string {
