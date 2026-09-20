@@ -1,6 +1,10 @@
 const BASE = 'http://127.0.0.1:9317';
 const DSH_URL = 'http://127.0.0.1:3080';
 
+// 与 popup.js 同值：popup 用 ping 比对，识别「后台还是旧脚本」的情况
+// （改完代码没在 chrome://extensions 重新加载时，service worker 会一直跑旧文件）。
+const BUILD = '2026-09-18.1';
+
 const VERSION_ALARM = 'dsh-version-check';
 const UPDATE_POLL_ALARM = 'dsh-update-poll';
 const UPDATE_NOTIFICATION_ID = 'dsh-update';
@@ -257,10 +261,11 @@ chrome.action.onClicked.addListener(async () => {
 // ── Popup 消息（状态 / 生命周期 / 控制 / 日志）──────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg.type !== 'string') return false;
-  const types = ['getStatus', 'getLifecycle', 'start', 'stop', 'restart', 'openPage', 'getLogs', 'getVersionInfo', 'checkUpdate', 'checkUpdateSilent', 'startUpdate', 'getUpdateStatus'];
+  const types = ['getStatus', 'getLifecycle', 'start', 'stop', 'restart', 'openPage', 'getLogs', 'getVersionInfo', 'checkUpdate', 'checkUpdateSilent', 'startUpdate', 'getUpdateStatus', 'ping'];
   if (!types.includes(msg.type)) return false;
   const run = async () => {
     switch (msg.type) {
+      case 'ping': return { ok: true, build: BUILD };
       case 'getStatus': return ctl('status');
       case 'getLifecycle': return getLifecycle();
       case 'start': { const r = await ctl('start'); updateIcon(); return r; }
@@ -334,6 +339,7 @@ async function checkForUpdates(manual) {
         iconUrl: chrome.runtime.getURL('icon-running-blue.png'),
         title: 'DSH 有新版本',
         message: '当前 ' + currentLabel + ' → 最新 ' + latestLabel +
+          (info.prerelease ? '（预发布版，需弹窗勾选「允许预发布版」）' : '') +
           '\n点击“更新并重启”，本地插件/设置不会被覆盖。',
         priority: 2,
         requireInteraction: true,
@@ -364,10 +370,23 @@ async function getUpdateStatus() {
   }
 }
 
+// 弹窗勾选的「允许预发布版」持久化在 storage；通知按钮路径不带参数，按它回落。
+function allowPrereleasePref() {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get({ allowPrerelease: false }, (d) => resolve(d.allowPrerelease === true));
+    } catch (e) {
+      resolve(false);
+    }
+  });
+}
+
 async function startUpdate(allowPrerelease) {
+  const allow = allowPrerelease === true
+    || (allowPrerelease === undefined && await allowPrereleasePref());
   let r;
   try {
-    const url = BASE + '/update' + (allowPrerelease === true ? '?allowPrerelease=1' : '');
+    const url = BASE + '/update' + (allow ? '?allowPrerelease=1' : '');
     r = await (await fetch(url, { method: 'POST', signal: AbortSignal.timeout(10000) })).json();
   } catch (e) {
     const failed = { ok: false, error: '无法连接本地守护进程' };

@@ -518,7 +518,8 @@ async function runUpdate(force, opts) {
     if (info.hasUpdate && info.prerelease && !allowPre && !force) {
       throw new Error(
         'registry 上更高的版本 ' + info.latest.packageVersion + ' 属预发布通道（' + info.latest.latestTag + '），默认不自动安装预发布版。' +
-        '如需安装，请在扩展弹窗勾选「允许预发布版」后重试（等价于 POST /update?allowPrerelease=1），或等待正式版发布。'
+        '如需安装，请在扩展弹窗勾选「允许预发布版」后重试（等价于 POST /update?allowPrerelease=1），或等待正式版发布。' +
+        '若已勾选仍报此错，说明扩展后台仍是旧脚本（未在 chrome://extensions 重新加载），可对照守护进程日志的 update request 行确认本次请求是否带开关。'
       );
     }
     const doUpdate = info.hasUpdate;
@@ -642,6 +643,7 @@ const server = http.createServer(async function (req, res) {
     const force = req.url.startsWith('/repair') || u.searchParams.get('force') === '1' || u.searchParams.get('force') === 'true';
     const allowPrerelease = u.searchParams.get('allowPrerelease') === '1' || u.searchParams.get('allowPrerelease') === 'true';
     updating = true;
+    log('update request: ' + req.url + ' (force=' + force + ', allowPrerelease=' + allowPrerelease + ')');
     runUpdate(force, { allowPrerelease: allowPrerelease });
     respond(res, { ok: true, started: true, state: 'running', force: force, allowPrerelease: allowPrerelease });
     return;

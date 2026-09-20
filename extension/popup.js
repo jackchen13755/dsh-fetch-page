@@ -1,6 +1,10 @@
 // DSH 控制 popup：状态 / 启动进度条 / 控制按钮 / 错误日志
 const $ = (id) => document.getElementById(id);
 
+// 与 background.js 同值：service worker 可能仍在跑旧脚本（改完代码没在
+// chrome://extensions 重新加载），旧脚本会静默忽略 allowPrerelease 等新参数。
+const BUILD = '2026-09-18.1';
+
 let pollTimer = null;
 let busy = false;
 
@@ -262,6 +266,7 @@ let updateBusy = false;
 let updateAvailable = false;
 let updatePollTimer = null;
 let latestIsPre = false;
+let swStaleBuild = null;
 
 function formatVersion(v) {
   if (!v) return '—';
@@ -287,6 +292,7 @@ function renderVersion(info) {
     $('updateStatus').className = 'version-status' + (err ? ' err' : '');
     updateAvailable = false;
     latestIsPre = false;
+    applyStaleWarning();
     setUpdateBusy(updateBusy);
     return;
   }
@@ -302,7 +308,16 @@ function renderVersion(info) {
     $('updateStatus').textContent = '当前已是最新版本';
     $('updateStatus').className = 'version-status ok';
   }
+  applyStaleWarning();
   setUpdateBusy(updateBusy);
+}
+
+// 后台脚本版本不一致时压过普通文案：这种状态下勾选开关不会生效
+function applyStaleWarning() {
+  if (!swStaleBuild) return;
+  $('updateStatus').textContent = '后台脚本仍是旧版本（build ' + swStaleBuild
+    + '），请在 chrome://extensions 重新加载扩展；否则勾选「允许预发布版」不会生效';
+  $('updateStatus').className = 'version-status err';
 }
 
 async function loadVersionInfo() {
@@ -390,6 +405,29 @@ async function doStartUpdate() {
   }
 }
 
+// 勾选状态持久化：后台的通知按钮路径不带参数，按同一偏好发请求
+function bindAllowPreference() {
+  const box = $('chkAllowPre');
+  if (!box) return;
+  chrome.storage.local.get({ allowPrerelease: false }, (d) => {
+    box.checked = d.allowPrerelease === true;
+  });
+  box.addEventListener('change', () => {
+    chrome.storage.local.set({ allowPrerelease: box.checked });
+  });
+}
+
+async function checkBackgroundBuild() {
+  const r = await send({ type: 'ping' });
+  if (r && r.ok && r.build) {
+    if (r.build !== BUILD) swStaleBuild = r.build;
+  } else {
+    // 旧后台不认识 ping（消息端口直接关闭）：必然不是当前脚本
+    swStaleBuild = '未知（旧版）';
+  }
+  if (swStaleBuild) applyStaleWarning();
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   $('btnStart').addEventListener('click', doStart);
   $('btnRestart').addEventListener('click', doRestart);
@@ -399,6 +437,8 @@ document.addEventListener('DOMContentLoaded', () => {
   $('btnCheckUpdate').addEventListener('click', doCheckUpdate);
   $('btnUpdate').addEventListener('click', doStartUpdate);
 
+  bindAllowPreference();
+  checkBackgroundBuild();
   refresh();
   startPolling(2000);
   loadVersionInfo();
