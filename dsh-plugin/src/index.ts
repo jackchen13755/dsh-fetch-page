@@ -130,6 +130,49 @@ function selectedValue(html: string, name: string): string {
 
 interface SelectOption { value: string; text: string; title: string }
 
+/**
+ * 禅道解决表单的服务端硬约束（实测所得）。
+ * 不满足时禅道仍返回 HTTP 200，仅在响应体里回一段 `alert('…')` 并保持 bug 状态不变，
+ * 所以必须在本地先拦截，避免「以为提交成功」的空跑。
+ */
+const ZENTAO_RESOLVE_FIELD_RULES: { name: string; label: string; max?: number; required?: boolean }[] = [
+  { name: 'resolution', label: '解决方案', required: true },
+  { name: 'reason', label: 'Bug产生原因', required: true },
+  { name: 'bugInchargedBy', label: 'Bug所属人', required: true },
+  { name: 'changeImpact', label: '代码变更影响范围', required: true },
+  { name: 'detail_reason', label: 'bug详细原因', max: 512 },
+  { name: 'comment', label: '备注' },
+]
+
+/** 按禅道（PHP mb_strlen）口径统计字符数：按码点算，emoji/代理对不重复计数。 */
+function charLength(value: string): number {
+  return [...value].length
+}
+
+/** 提交前本地校验（返回违规说明；空数组表示通过）。 */
+function validateZentaoResolveFields(fields: [string, string][]): string[] {
+  const problems: string[] = []
+  const map = new Map(fields)
+  for (const rule of ZENTAO_RESOLVE_FIELD_RULES) {
+    const value = String(map.get(rule.name) ?? '')
+    if (rule.required === true && value === '') {
+      problems.push(`『${rule.label}』不能为空`)
+      continue
+    }
+    if (rule.max !== undefined && value !== '' && charLength(value) > rule.max) {
+      problems.push(`『${rule.label}』长度 ${charLength(value)} 超出上限 ${rule.max}（请压缩到 ${rule.max} 字以内后重试）`)
+    }
+  }
+  return problems
+}
+
+/** 从禅道响应里提取 `alert('…')` 文案——服务端校验失败时就是用它回话的。 */
+function zenTaoAlertMessage(body: string): string {
+  const m = /alert\(\s*(['"])([\s\S]*?)\1\s*\)/.exec(body)
+  if (!m?.[2]) return ''
+  return m[2].replace(/\\n/g, ' ').replace(/\\'/g, "'").replace(/\s+/g, ' ').trim()
+}
+
 /** 解析指定 select 的全部 <option>，返回 value/text/title。 */
 function selectOptions(html: string, name: string): SelectOption[] {
   const selMatch = html.match(new RegExp(`<select\\b[^>]*\\bname=(['\"])${name}\\1[^>]*>([\\s\\S]*?)<\\/select>`))
@@ -332,15 +375,15 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   ctx.tools.register(defineTool({
     name: 'zentao_resolve_bug',
-    description: '通过浏览器插件桥接解决禅道 Bug（zen.sgrl.io）：复用 fetch_page 的浏览器转发链路，读取当前登录态的详情/解决表单、解析 uid 与默认值、标注必填项，并提交解决。无需读取 Chrome Cookie。',
+    description: '通过浏览器插件桥接解决禅道 Bug（zen.sgrl.io）：复用 fetch_page 的浏览器转发链路，读取当前登录态的详情/解决表单、解析 uid 与默认值、标注必填项，并提交解决。无需读取 Chrome Cookie。提交前会本地校验禅道字段约束（『代码变更影响范围』不能为空、『bug详细原因』≤512 字），服务端拒绝时回显其 alert 文案。',
     parameters: {
       bugID: { type: 'string', required: true, description: '禅道 Bug ID（必填）' },
       resolution: { type: 'string', enum: ['bydesign', 'duplicate', 'external', 'fixed', 'notrepro', 'postponed', 'willnotfix'], description: '解决方案，默认 fixed' },
       reason: { type: 'string', description: 'Bug产生原因，默认 codeBug' },
       build: { type: 'string', description: '解决版本（可传下拉里的 build ID 或显示名称，自动映射为下拉 option value）；缺省自动取该 bug 最近一次解决版本，其次取解决表单默认 resolvedBuild' },
       comment: { type: 'string', description: '备注' },
-      detail: { type: 'string', description: 'bug详细原因' },
-      impact: { type: 'string', description: '代码变更影响范围' },
+      detail: { type: 'string', description: 'bug详细原因（服务端上限 512 字，超长会被拒绝；建议先自行压缩）' },
+      impact: { type: 'string', description: '代码变更影响范围（服务端必填，不能为空；表单已有内容时会沿用表单内容）' },
       assignedTo: { type: 'string', description: '指派给（缺省使用表单默认）' },
       inChargedBy: { type: 'string', description: 'Bug所属人（表单必填项，建议显式指定）' },
       force: { type: 'boolean', description: '当前已是已解决时仍强制再次解决' },
@@ -359,6 +402,8 @@ export function apply(ctx: Context, config: Config = {}): void {
           fields: { type: 'array', items: { type: 'array', items: { type: 'string' } } },
           required: { type: 'array', items: { type: 'string' } },
           missingRequired: { type: 'array', items: { type: 'string' } },
+          problems: { type: 'array', items: { type: 'string' } },
+          serverError: { type: 'string' },
           url: { type: 'string' },
           error: { type: 'string' },
           body: { type: 'string' },
@@ -369,6 +414,8 @@ export function apply(ctx: Context, config: Config = {}): void {
         const lines: string[] = []
         if (value.dryRun) lines.push(`[dry-run] Bug ${value.bugID} 将提交以下字段（当前状态：${value.status || '未知'}）：`)
         else if (value.ok) lines.push(`成功：Bug ${value.bugID} 状态已变为「${value.status}」。`)
+        else if (value.serverError) lines.push(`服务端拒绝：${value.serverError}`)
+        else if (Array.isArray(value.problems) && value.problems.length) lines.push(`本地校验未通过，未提交（Bug ${value.bugID}）。`)
         else lines.push(`提交完成但校验异常：Bug ${value.bugID} 状态「${value.status || '未知'}」。`)
         if (Array.isArray(value.fields)) {
           const req = new Set<string>(value.required || [])
@@ -378,7 +425,13 @@ export function apply(ctx: Context, config: Config = {}): void {
           }
         }
         if (Array.isArray(value.missingRequired) && value.missingRequired.length) lines.push(`注意：必填项为空：${value.missingRequired.join(', ')}`)
+        if (Array.isArray(value.problems) && value.problems.length) {
+          lines.push('字段约束不满足：')
+          for (const p of value.problems) lines.push(`  - ${p}`)
+          lines.push('（禅道字段上限：bug详细原因 ≤512 字；代码变更影响范围不能为空。请调整入参后重试。）')
+        }
         if (value.message) lines.push(value.message)
+        if (value.body) lines.push(`响应片段：${String(value.body).slice(0, 300)}`)
         if (value.url) lines.push(value.url)
         return [textBlock(lines.join('\n'))]
       },
@@ -431,12 +484,17 @@ export function apply(ctx: Context, config: Config = {}): void {
           const absentRequired = required.filter((r) => !fields.some(([k]) => k === r))
           const emptyRequired = fields.filter(([k, v]) => requiredSet.has(k) && !v).map(([k]) => k)
           const missingRequired = [...absentRequired, ...emptyRequired]
+          // 禅道字段硬约束（超长/为空只会回 alert、状态不变）→ 提交前先本地拦截
+          const problems = validateZentaoResolveFields(fields)
 
           if (a.dryRun) {
-            return { ok: true, dryRun: true, bugID, status, fields, required, missingRequired, url: viewUrl }
+            return { ok: true, dryRun: true, bugID, status, fields, required, missingRequired, problems, url: viewUrl }
           }
           if (missingRequired.length > 0) {
-            return { ok: false, bugID, status, fields, required, missingRequired, url: viewUrl, message: `必填项为空，未提交：${missingRequired.join(', ')}` }
+            return { ok: false, bugID, status, fields, required, missingRequired, problems, url: viewUrl, message: `必填项为空，未提交：${missingRequired.join(', ')}` }
+          }
+          if (problems.length > 0) {
+            return { ok: false, bugID, status, fields, required, missingRequired, problems, url: viewUrl, message: `本地校验未通过，未提交：${problems.join('；')}` }
           }
 
           const body = fields
@@ -445,13 +503,19 @@ export function apply(ctx: Context, config: Config = {}): void {
             .join('&')
           const postResp = await forward('POST', formUrl, { 'Content-Type': 'application/x-www-form-urlencoded' }, body)
           maybeThrow(postResp, '提交失败')
+          const postBody = String(postResp.body ?? '')
 
           const afterResp = await forward('GET', viewUrl)
           const afterStatus = currentStatus(String(afterResp.body ?? ''))
           if (afterStatus === '已解决') {
             return { ok: true, bugID, status: afterStatus, message: '成功，Bug 已解决', url: viewUrl }
           }
-          return { ok: false, bugID, status: afterStatus || '未知', message: '提交完成但状态校验异常，请打开页面确认', url: viewUrl, body: String(postResp.body ?? '').slice(0, 500) }
+          // 服务端拒绝时响应体里带 alert('…')：原样回显，避免只报「状态异常」而无从下手
+          const serverError = zenTaoAlertMessage(postBody)
+          if (serverError) {
+            return { ok: false, bugID, status: afterStatus || status, fields, problems, url: viewUrl, serverError, body: postBody.slice(0, 500), message: `服务端拒绝：${serverError}` }
+          }
+          return { ok: false, bugID, status: afterStatus || '未知', message: '提交完成但状态校验异常，请打开页面确认', url: viewUrl, body: postBody.slice(0, 500) }
         }
 
         return await submitOnce()
