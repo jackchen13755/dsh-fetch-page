@@ -215,20 +215,45 @@ function parseForm(html) {
         requiredFields: extractRequiredFields(html),
     };
 }
+/**
+ * Run one command in the foreground across both shapes of the `ctx.shell` seam.
+ *
+ * 0.1.7 *replaced* the foreground API: `run(spec): Promise<ShellRunResult>` is gone, and
+ * the projection moved onto the handle — `execute(spec)` → `ShellExecution`, whose
+ * `result()` resolves with the same `ShellRunResult`. The version this repo pins in
+ * node_modules (0.1.2-rc.1) still declares `run`, so the old call typechecked while
+ * every bridge call died at runtime with "ctx.shell.run is not a function" — the drift
+ * was invisible until the plugin was loaded into a newer harness, and it silently
+ * removed the only path that reaches a logged-in page *without* exporting cookies.
+ *
+ * Prefer the current pair, fall back to the legacy `run()`, so this package keeps
+ * working across the whole 0.1.x range it peers on.
+ */
+async function runForeground(shell, spec) {
+    const seam = shell;
+    if (typeof seam.execute === 'function') {
+        const handle = await seam.execute(spec);
+        return await handle.result();
+    }
+    if (typeof seam.run === 'function')
+        return await seam.run(spec);
+    throw new Error('ctx.shell exposes neither execute() nor run(); cannot run a foreground command');
+}
 export function apply(ctx, config = {}) {
     const daemonUrl = config.daemonUrl ?? 'http://127.0.0.1:9317';
     const daemonPath = config.daemonPath ?? join(homedir(), 'dsh', 'dsh-relay-daemon');
     const workdir = config.workdir ?? homedir();
     const workspaceRoot = config.workspaceRoot ?? homedir();
-    function run(cmd, stdin, timeoutMs = 45000) {
-        return ctx.shell.run(ctx.shell.resolve({
+    async function run(cmd, stdin, timeoutMs = 45000) {
+        const spec = ctx.shell.resolve({
             command: cmd,
             workdir,
             timeoutMs,
             stdoutMaxBytes: 8388608,
             sandboxPolicy: { mode: 'danger-full-access', workspaceRoot },
             ...(stdin !== undefined ? { stdin } : {}),
-        }));
+        });
+        return await runForeground(ctx.shell, spec);
     }
     async function ensureDaemon() {
         await run(`lsof -ti tcp:9317 -sTCP:LISTEN >/dev/null 2>&1 || (nohup /usr/local/bin/node ${daemonPath} > /tmp/dsh-relay-daemon.log 2>&1 &)`);

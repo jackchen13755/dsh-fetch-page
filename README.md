@@ -234,3 +234,27 @@ WebSocket），捕获完成后注入浮层下载按钮；`extension/background.j
 - 控制与转发都走守护进程 9317，统一在扩展 `background.js` 里完成（左键打开页面、右键版本/更新/重启/停止）。
 - 版本检查与更新也走守护进程 9317：`/version`、`/update-check`、`/update`、`/update-status`。
 - 三个组件里，只有 DSH 插件包的 `fetch_page` 工具是会话级挂载；守护进程（launchd）、扩展都是常驻的。
+
+## 开发：`ctx.shell` 前台执行接口（易漂移，别再踩）
+
+两个插件（`dsh-plugin/`、`browser-plugin/`）都通过 `ctx.shell` 执行 curl / browser-harness。
+这个接口**换过一次形**，而仓库 `node_modules` 里钉的 devDependency 是旧的，所以类型检查过得去、
+运行时才炸——升级 DSH 后 `fetch_page` 报 `ctx.shell.run is not a function` 就是这么来的：
+
+| 版本 | 前台执行 | 结果投影 |
+| --- | --- | --- |
+| `0.1.1-rc.2` / `0.1.2-rc.1`（本仓库钉的） | `run(spec): Promise<ShellRunResult>` | 直接 resolve 结果 |
+| `>= 0.1.7`（当前 DSH 运行时） | `execute(spec): Promise<ShellExecution>` | `await handle.result()` |
+
+两处都走同一个 `runForeground()`（`src/index.ts`）：**优先 `execute()`+`result()`，回退旧 `run()`**，
+因此对声明支持的一整段 `0.1.x` 都成立。
+
+改动这两个文件后请跑离线回归（不需要真浏览器/守护进程）：
+
+```bash
+node scripts/smoke-seam.mjs
+```
+
+它用假 `ctx.shell` 分别模拟「新接口（只有 execute）」「旧接口（只有 run）」「两者都没有」三种形态，
+驱动真实的 `fetch_page` / `browser` 工具，并检查调用方传入的 `timeoutMs` 没有被写死覆盖。
+（旧接口形态就是当初的故障现场：`run` 不存在时工具返回 `转发失败: ctx.shell.run is not a function`。）

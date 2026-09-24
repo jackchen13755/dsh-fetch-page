@@ -229,21 +229,57 @@ function parseForm(html: string): Record<string, any> {
   }
 }
 
+/** Fully-resolved spec, produced by `ctx.shell.resolve()` and consumed by `execute()`/`run()`. */
+type ShellSpec = ReturnType<Context['shell']['resolve']>
+
+/** The foreground projection carried by the handle `execute()` returns in the current seam. */
+interface ShellExecutionLike {
+  result(): Promise<ShellRunResult>
+}
+
+/**
+ * Run one command in the foreground across both shapes of the `ctx.shell` seam.
+ *
+ * 0.1.7 *replaced* the foreground API: `run(spec): Promise<ShellRunResult>` is gone, and
+ * the projection moved onto the handle — `execute(spec)` → `ShellExecution`, whose
+ * `result()` resolves with the same `ShellRunResult`. The version this repo pins in
+ * node_modules (0.1.2-rc.1) still declares `run`, so the old call typechecked while
+ * every bridge call died at runtime with "ctx.shell.run is not a function" — the drift
+ * was invisible until the plugin was loaded into a newer harness, and it silently
+ * removed the only path that reaches a logged-in page *without* exporting cookies.
+ *
+ * Prefer the current pair, fall back to the legacy `run()`, so this package keeps
+ * working across the whole 0.1.x range it peers on.
+ */
+async function runForeground(shell: Context['shell'], spec: ShellSpec): Promise<ShellRunResult> {
+  const seam = shell as unknown as {
+    execute?: (spec: ShellSpec) => Promise<ShellExecutionLike>
+    run?: (spec: ShellSpec) => Promise<ShellRunResult>
+  }
+  if (typeof seam.execute === 'function') {
+    const handle = await seam.execute(spec)
+    return await handle.result()
+  }
+  if (typeof seam.run === 'function') return await seam.run(spec)
+  throw new Error('ctx.shell exposes neither execute() nor run(); cannot run a foreground command')
+}
+
 export function apply(ctx: Context, config: Config = {}): void {
   const daemonUrl = config.daemonUrl ?? 'http://127.0.0.1:9317'
   const daemonPath = config.daemonPath ?? join(homedir(), 'dsh', 'dsh-relay-daemon')
   const workdir = config.workdir ?? homedir()
   const workspaceRoot = config.workspaceRoot ?? homedir()
 
-  function run(cmd: string, stdin?: string, timeoutMs = 45000): Promise<ShellRunResult> {
-    return ctx.shell.run(ctx.shell.resolve({
+  async function run(cmd: string, stdin?: string, timeoutMs = 45000): Promise<ShellRunResult> {
+    const spec = ctx.shell.resolve({
       command: cmd,
       workdir,
       timeoutMs,
       stdoutMaxBytes: 8388608,
       sandboxPolicy: { mode: 'danger-full-access', workspaceRoot },
       ...(stdin !== undefined ? { stdin } : {}),
-    }))
+    })
+    return await runForeground(ctx.shell, spec)
   }
 
   async function ensureDaemon(): Promise<void> {

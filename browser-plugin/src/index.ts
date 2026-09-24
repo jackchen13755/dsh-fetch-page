@@ -202,20 +202,52 @@ function extractReport(out: string): Record<string, any> | null {
   }
 }
 
+/** Fully-resolved spec, produced by `ctx.shell.resolve()` and consumed by `execute()`/`run()`. */
+type ShellSpec = ReturnType<Context['shell']['resolve']>
+
+/** The foreground projection carried by the handle `execute()` returns in the current seam. */
+interface ShellExecutionLike {
+  result(): Promise<ShellRunResult>
+}
+
+/**
+ * Run one command in the foreground across both shapes of the `ctx.shell` seam.
+ *
+ * Same API move as the `dsh-plugin` twin: 0.1.7 *replaced* `run(spec)` with
+ * `execute(spec)` → `ShellExecution`, whose `result()` resolves with the same
+ * `ShellRunResult`. The version pinned in this repo's node_modules (0.1.1-rc.2) still
+ * declares `run`, so `ctx.shell.run(...)` typechecked while every call failed at runtime
+ * with "ctx.shell.run is not a function". Prefer the current pair, fall back to the
+ * legacy `run()`, so the package keeps working across the 0.1.x range it peers on.
+ */
+async function runForeground(shell: Context['shell'], spec: ShellSpec): Promise<ShellRunResult> {
+  const seam = shell as unknown as {
+    execute?: (spec: ShellSpec) => Promise<ShellExecutionLike>
+    run?: (spec: ShellSpec) => Promise<ShellRunResult>
+  }
+  if (typeof seam.execute === 'function') {
+    const handle = await seam.execute(spec)
+    return await handle.result()
+  }
+  if (typeof seam.run === 'function') return await seam.run(spec)
+  throw new Error('ctx.shell exposes neither execute() nor run(); cannot run a foreground command')
+}
+
 export function apply(ctx: Context, config: Config = {}): void {
   const browserHarnessPath = config.browserHarnessPath ?? join(homedir(), '.local', 'bin', 'browser-harness')
   const workdir = config.workdir ?? homedir()
   const workspaceRoot = config.workspaceRoot ?? homedir()
 
-  function run(cmd: string, stdin?: string): Promise<ShellRunResult> {
-    return ctx.shell.run(ctx.shell.resolve({
+  async function run(cmd: string, stdin?: string): Promise<ShellRunResult> {
+    const spec = ctx.shell.resolve({
       command: cmd,
       workdir,
       timeoutMs: 300000,
       stdoutMaxBytes: 8388608,
       sandboxPolicy: { mode: 'danger-full-access', workspaceRoot },
       ...(stdin !== undefined ? { stdin } : {}),
-    }))
+    })
+    return await runForeground(ctx.shell, spec)
   }
 
   ctx.tools.register(defineTool({
