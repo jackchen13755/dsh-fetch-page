@@ -409,7 +409,12 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (st >= 400) throw new Error(`${label}: HTTP ${st}${resp.statusText ? ' ' + resp.statusText : ''}`)
   }
 
-  ctx.tools.register(defineTool({
+  // 这个工具名 dsh-zentao-workbench 也在用（它是现行的禅道链路，本工具是历史方案）。
+  // DSH 的工具表对重名是硬拒绝，且一次 register 抛错会带走整个插件 fiber —— 连
+  // fetch_page 一起没了（2026-09-29 实测：两个插件同时装载时本插件整条 failed）。
+  // 所以这里让位：重名就只警告并跳过这个历史工具，fetch_page 照常注册。
+  try {
+    ctx.tools.register(defineTool({
     name: 'zentao_resolve_bug',
     description: '通过浏览器插件桥接解决禅道 Bug（zen.sgrl.io）：复用 fetch_page 的浏览器转发链路，读取当前登录态的详情/解决表单、解析 uid 与默认值、标注必填项，并提交解决。无需读取 Chrome Cookie。提交前会本地校验禅道字段约束（『代码变更影响范围』不能为空、『bug详细原因』≤512 字），服务端拒绝时回显其 alert 文案。',
     parameters: {
@@ -559,5 +564,8 @@ export function apply(ctx: Context, config: Config = {}): void {
         return { error: e instanceof Error ? e.message : String(e) }
       }
     },
-  }))
+    }))
+  } catch (error) {
+    ctx.logger?.warn?.(`[dsh-tool-fetch-page] 跳过历史工具 zentao_resolve_bug（名字已被占用）：${error instanceof Error ? error.message : String(error)}`)
+  }
 }

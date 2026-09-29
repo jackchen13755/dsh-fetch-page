@@ -370,168 +370,177 @@ export function apply(ctx, config = {}) {
         if (st >= 400)
             throw new Error(`${label}: HTTP ${st}${resp.statusText ? ' ' + resp.statusText : ''}`);
     }
-    ctx.tools.register(defineTool({
-        name: 'zentao_resolve_bug',
-        description: '通过浏览器插件桥接解决禅道 Bug（zen.sgrl.io）：复用 fetch_page 的浏览器转发链路，读取当前登录态的详情/解决表单、解析 uid 与默认值、标注必填项，并提交解决。无需读取 Chrome Cookie。提交前会本地校验禅道字段约束（『代码变更影响范围』不能为空、『bug详细原因』≤512 字），服务端拒绝时回显其 alert 文案。',
-        parameters: {
-            bugID: { type: 'string', required: true, description: '禅道 Bug ID（必填）' },
-            resolution: { type: 'string', enum: ['bydesign', 'duplicate', 'external', 'fixed', 'notrepro', 'postponed', 'willnotfix'], description: '解决方案，默认 fixed' },
-            reason: { type: 'string', description: 'Bug产生原因，默认 codeBug' },
-            build: { type: 'string', description: '解决版本（可传下拉里的 build ID 或显示名称，自动映射为下拉 option value）；缺省自动取该 bug 最近一次解决版本，其次取解决表单默认 resolvedBuild' },
-            comment: { type: 'string', description: '备注' },
-            detail: { type: 'string', description: 'bug详细原因（服务端上限 512 字，超长会被拒绝；建议先自行压缩）' },
-            impact: { type: 'string', description: '代码变更影响范围（服务端必填，不能为空；表单已有内容时会沿用表单内容）' },
-            assignedTo: { type: 'string', description: '指派给（缺省使用表单默认）' },
-            inChargedBy: { type: 'string', description: 'Bug所属人（表单必填项，建议显式指定）' },
-            force: { type: 'boolean', description: '当前已是已解决时仍强制再次解决' },
-            dryRun: { type: 'boolean', description: '只解析并返回提交字段，不真正提交' },
-        },
-        output: {
-            schema: {
-                type: 'object',
-                additionalProperties: true,
-                properties: {
-                    ok: { type: 'boolean' },
-                    dryRun: { type: 'boolean' },
-                    bugID: { type: 'string' },
-                    status: { type: 'string' },
-                    message: { type: 'string' },
-                    fields: { type: 'array', items: { type: 'array', items: { type: 'string' } } },
-                    required: { type: 'array', items: { type: 'string' } },
-                    missingRequired: { type: 'array', items: { type: 'string' } },
-                    problems: { type: 'array', items: { type: 'string' } },
-                    serverError: { type: 'string' },
-                    url: { type: 'string' },
-                    error: { type: 'string' },
-                    body: { type: 'string' },
+    // 这个工具名 dsh-zentao-workbench 也在用（它是现行的禅道链路，本工具是历史方案）。
+    // DSH 的工具表对重名是硬拒绝，且一次 register 抛错会带走整个插件 fiber —— 连
+    // fetch_page 一起没了（2026-09-29 实测：两个插件同时装载时本插件整条 failed）。
+    // 所以这里让位：重名就只警告并跳过这个历史工具，fetch_page 照常注册。
+    try {
+        ctx.tools.register(defineTool({
+            name: 'zentao_resolve_bug',
+            description: '通过浏览器插件桥接解决禅道 Bug（zen.sgrl.io）：复用 fetch_page 的浏览器转发链路，读取当前登录态的详情/解决表单、解析 uid 与默认值、标注必填项，并提交解决。无需读取 Chrome Cookie。提交前会本地校验禅道字段约束（『代码变更影响范围』不能为空、『bug详细原因』≤512 字），服务端拒绝时回显其 alert 文案。',
+            parameters: {
+                bugID: { type: 'string', required: true, description: '禅道 Bug ID（必填）' },
+                resolution: { type: 'string', enum: ['bydesign', 'duplicate', 'external', 'fixed', 'notrepro', 'postponed', 'willnotfix'], description: '解决方案，默认 fixed' },
+                reason: { type: 'string', description: 'Bug产生原因，默认 codeBug' },
+                build: { type: 'string', description: '解决版本（可传下拉里的 build ID 或显示名称，自动映射为下拉 option value）；缺省自动取该 bug 最近一次解决版本，其次取解决表单默认 resolvedBuild' },
+                comment: { type: 'string', description: '备注' },
+                detail: { type: 'string', description: 'bug详细原因（服务端上限 512 字，超长会被拒绝；建议先自行压缩）' },
+                impact: { type: 'string', description: '代码变更影响范围（服务端必填，不能为空；表单已有内容时会沿用表单内容）' },
+                assignedTo: { type: 'string', description: '指派给（缺省使用表单默认）' },
+                inChargedBy: { type: 'string', description: 'Bug所属人（表单必填项，建议显式指定）' },
+                force: { type: 'boolean', description: '当前已是已解决时仍强制再次解决' },
+                dryRun: { type: 'boolean', description: '只解析并返回提交字段，不真正提交' },
+            },
+            output: {
+                schema: {
+                    type: 'object',
+                    additionalProperties: true,
+                    properties: {
+                        ok: { type: 'boolean' },
+                        dryRun: { type: 'boolean' },
+                        bugID: { type: 'string' },
+                        status: { type: 'string' },
+                        message: { type: 'string' },
+                        fields: { type: 'array', items: { type: 'array', items: { type: 'string' } } },
+                        required: { type: 'array', items: { type: 'string' } },
+                        missingRequired: { type: 'array', items: { type: 'string' } },
+                        problems: { type: 'array', items: { type: 'string' } },
+                        serverError: { type: 'string' },
+                        url: { type: 'string' },
+                        error: { type: 'string' },
+                        body: { type: 'string' },
+                    },
+                },
+                render(_args, value) {
+                    if (value.error !== undefined && value.error !== '')
+                        return [textBlock(`错误: ${value.error}`)];
+                    const lines = [];
+                    if (value.dryRun)
+                        lines.push(`[dry-run] Bug ${value.bugID} 将提交以下字段（当前状态：${value.status || '未知'}）：`);
+                    else if (value.ok)
+                        lines.push(`成功：Bug ${value.bugID} 状态已变为「${value.status}」。`);
+                    else if (value.serverError)
+                        lines.push(`服务端拒绝：${value.serverError}`);
+                    else if (Array.isArray(value.problems) && value.problems.length)
+                        lines.push(`本地校验未通过，未提交（Bug ${value.bugID}）。`);
+                    else
+                        lines.push(`提交完成但校验异常：Bug ${value.bugID} 状态「${value.status || '未知'}」。`);
+                    if (Array.isArray(value.fields)) {
+                        const req = new Set(value.required || []);
+                        for (const item of value.fields) {
+                            const [k, v] = item;
+                            lines.push(`  ${k} = ${v || '(空)'}${req.has(k) ? '  [必填]' : ''}`);
+                        }
+                    }
+                    if (Array.isArray(value.missingRequired) && value.missingRequired.length)
+                        lines.push(`注意：必填项为空：${value.missingRequired.join(', ')}`);
+                    if (Array.isArray(value.problems) && value.problems.length) {
+                        lines.push('字段约束不满足：');
+                        for (const p of value.problems)
+                            lines.push(`  - ${p}`);
+                        lines.push('（禅道字段上限：bug详细原因 ≤512 字；代码变更影响范围不能为空。请调整入参后重试。）');
+                    }
+                    if (value.message)
+                        lines.push(value.message);
+                    if (value.body)
+                        lines.push(`响应片段：${String(value.body).slice(0, 300)}`);
+                    if (value.url)
+                        lines.push(value.url);
+                    return [textBlock(lines.join('\n'))];
                 },
             },
-            render(_args, value) {
-                if (value.error !== undefined && value.error !== '')
-                    return [textBlock(`错误: ${value.error}`)];
-                const lines = [];
-                if (value.dryRun)
-                    lines.push(`[dry-run] Bug ${value.bugID} 将提交以下字段（当前状态：${value.status || '未知'}）：`);
-                else if (value.ok)
-                    lines.push(`成功：Bug ${value.bugID} 状态已变为「${value.status}」。`);
-                else if (value.serverError)
-                    lines.push(`服务端拒绝：${value.serverError}`);
-                else if (Array.isArray(value.problems) && value.problems.length)
-                    lines.push(`本地校验未通过，未提交（Bug ${value.bugID}）。`);
-                else
-                    lines.push(`提交完成但校验异常：Bug ${value.bugID} 状态「${value.status || '未知'}」。`);
-                if (Array.isArray(value.fields)) {
-                    const req = new Set(value.required || []);
-                    for (const item of value.fields) {
-                        const [k, v] = item;
-                        lines.push(`  ${k} = ${v || '(空)'}${req.has(k) ? '  [必填]' : ''}`);
+            async execute(args, _exec) {
+                const a = args;
+                try {
+                    await ensureDaemon();
+                    const bugID = String(a.bugID ?? '');
+                    if (!bugID)
+                        return { error: '缺少 bugID' };
+                    const base = process.env.ZENTAO_BASE || 'https://zen.sgrl.io';
+                    const viewUrl = `${base}/index.php?m=bug&f=view&bugID=${bugID}`;
+                    const formUrl = `${base}/index.php?m=bug&f=resolve&bugID=${bugID}&onlybody=yes`;
+                    const viewResp = await forward('GET', viewUrl);
+                    maybeThrow(viewResp, '获取详情页失败');
+                    const viewHtml = String(viewResp.body ?? '');
+                    if (!isLoggedIn(viewHtml))
+                        throw new Error('浏览器未登录 zen.sgrl.io，请确认浏览器已登录后重试。');
+                    const status = currentStatus(viewHtml);
+                    if (!a.dryRun && status === '已解决' && !a.force) {
+                        return { ok: true, bugID, status, message: '当前已是已解决，无需操作；如需再次解决请加 force=true', url: viewUrl };
                     }
+                    // 解析解决表单并完成一次提交。
+                    const submitOnce = async () => {
+                        const formResp = await forward('GET', formUrl);
+                        maybeThrow(formResp, '获取解决表单失败');
+                        const formHtml = String(formResp.body ?? '');
+                        if (!isLoggedIn(formHtml))
+                            throw new Error('浏览器未登录 zen.sgrl.io，无法打开解决表单。');
+                        const form = parseForm(formHtml);
+                        if (!form.uid)
+                            throw new Error('解析解决表单失败：未找到 uid（kuid）。');
+                        const rawBuild = String(a.build ?? '') || lastResolvedBuild(viewHtml) || String(form.resolvedBuild ?? '');
+                        const build = resolveBuildId(rawBuild, Array.isArray(form.resolvedBuildOptions) ? form.resolvedBuildOptions : []);
+                        const fields = [
+                            ['resolution', String(a.resolution ?? 'fixed')],
+                            ['reason', String(a.reason ?? 'codeBug')],
+                            ['bugInchargedBy', String(a.inChargedBy || form.bugInchargedBy || '')],
+                            ['assignedTo', String(a.assignedTo || form.assignedTo || '')],
+                            ['resolvedDate', String(form.resolvedDate ?? '')],
+                            ['uid', String(form.uid ?? '')],
+                        ];
+                        if (build)
+                            fields.push(['resolvedBuild', build]);
+                        if (a.impact || form.changeImpact)
+                            fields.push(['changeImpact', String(a.impact || form.changeImpact || '')]);
+                        if (a.comment)
+                            fields.push(['comment', String(a.comment)]);
+                        if (a.detail)
+                            fields.push(['detail_reason', String(a.detail)]);
+                        const required = Array.isArray(form.requiredFields) ? form.requiredFields : [];
+                        const requiredSet = new Set(required);
+                        const absentRequired = required.filter((r) => !fields.some(([k]) => k === r));
+                        const emptyRequired = fields.filter(([k, v]) => requiredSet.has(k) && !v).map(([k]) => k);
+                        const missingRequired = [...absentRequired, ...emptyRequired];
+                        // 禅道字段硬约束（超长/为空只会回 alert、状态不变）→ 提交前先本地拦截
+                        const problems = validateZentaoResolveFields(fields);
+                        if (a.dryRun) {
+                            return { ok: true, dryRun: true, bugID, status, fields, required, missingRequired, problems, url: viewUrl };
+                        }
+                        if (missingRequired.length > 0) {
+                            return { ok: false, bugID, status, fields, required, missingRequired, problems, url: viewUrl, message: `必填项为空，未提交：${missingRequired.join(', ')}` };
+                        }
+                        if (problems.length > 0) {
+                            return { ok: false, bugID, status, fields, required, missingRequired, problems, url: viewUrl, message: `本地校验未通过，未提交：${problems.join('；')}` };
+                        }
+                        const body = fields
+                            .filter(([, v]) => v !== undefined && v !== null && v !== '')
+                            .map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v))
+                            .join('&');
+                        const postResp = await forward('POST', formUrl, { 'Content-Type': 'application/x-www-form-urlencoded' }, body);
+                        maybeThrow(postResp, '提交失败');
+                        const postBody = String(postResp.body ?? '');
+                        const afterResp = await forward('GET', viewUrl);
+                        const afterStatus = currentStatus(String(afterResp.body ?? ''));
+                        if (afterStatus === '已解决') {
+                            return { ok: true, bugID, status: afterStatus, message: '成功，Bug 已解决', url: viewUrl };
+                        }
+                        // 服务端拒绝时响应体里带 alert('…')：原样回显，避免只报「状态异常」而无从下手
+                        const serverError = zenTaoAlertMessage(postBody);
+                        if (serverError) {
+                            return { ok: false, bugID, status: afterStatus || status, fields, problems, url: viewUrl, serverError, body: postBody.slice(0, 500), message: `服务端拒绝：${serverError}` };
+                        }
+                        return { ok: false, bugID, status: afterStatus || '未知', message: '提交完成但状态校验异常，请打开页面确认', url: viewUrl, body: postBody.slice(0, 500) };
+                    };
+                    return await submitOnce();
                 }
-                if (Array.isArray(value.missingRequired) && value.missingRequired.length)
-                    lines.push(`注意：必填项为空：${value.missingRequired.join(', ')}`);
-                if (Array.isArray(value.problems) && value.problems.length) {
-                    lines.push('字段约束不满足：');
-                    for (const p of value.problems)
-                        lines.push(`  - ${p}`);
-                    lines.push('（禅道字段上限：bug详细原因 ≤512 字；代码变更影响范围不能为空。请调整入参后重试。）');
+                catch (e) {
+                    return { error: e instanceof Error ? e.message : String(e) };
                 }
-                if (value.message)
-                    lines.push(value.message);
-                if (value.body)
-                    lines.push(`响应片段：${String(value.body).slice(0, 300)}`);
-                if (value.url)
-                    lines.push(value.url);
-                return [textBlock(lines.join('\n'))];
             },
-        },
-        async execute(args, _exec) {
-            const a = args;
-            try {
-                await ensureDaemon();
-                const bugID = String(a.bugID ?? '');
-                if (!bugID)
-                    return { error: '缺少 bugID' };
-                const base = process.env.ZENTAO_BASE || 'https://zen.sgrl.io';
-                const viewUrl = `${base}/index.php?m=bug&f=view&bugID=${bugID}`;
-                const formUrl = `${base}/index.php?m=bug&f=resolve&bugID=${bugID}&onlybody=yes`;
-                const viewResp = await forward('GET', viewUrl);
-                maybeThrow(viewResp, '获取详情页失败');
-                const viewHtml = String(viewResp.body ?? '');
-                if (!isLoggedIn(viewHtml))
-                    throw new Error('浏览器未登录 zen.sgrl.io，请确认浏览器已登录后重试。');
-                const status = currentStatus(viewHtml);
-                if (!a.dryRun && status === '已解决' && !a.force) {
-                    return { ok: true, bugID, status, message: '当前已是已解决，无需操作；如需再次解决请加 force=true', url: viewUrl };
-                }
-                // 解析解决表单并完成一次提交。
-                const submitOnce = async () => {
-                    const formResp = await forward('GET', formUrl);
-                    maybeThrow(formResp, '获取解决表单失败');
-                    const formHtml = String(formResp.body ?? '');
-                    if (!isLoggedIn(formHtml))
-                        throw new Error('浏览器未登录 zen.sgrl.io，无法打开解决表单。');
-                    const form = parseForm(formHtml);
-                    if (!form.uid)
-                        throw new Error('解析解决表单失败：未找到 uid（kuid）。');
-                    const rawBuild = String(a.build ?? '') || lastResolvedBuild(viewHtml) || String(form.resolvedBuild ?? '');
-                    const build = resolveBuildId(rawBuild, Array.isArray(form.resolvedBuildOptions) ? form.resolvedBuildOptions : []);
-                    const fields = [
-                        ['resolution', String(a.resolution ?? 'fixed')],
-                        ['reason', String(a.reason ?? 'codeBug')],
-                        ['bugInchargedBy', String(a.inChargedBy || form.bugInchargedBy || '')],
-                        ['assignedTo', String(a.assignedTo || form.assignedTo || '')],
-                        ['resolvedDate', String(form.resolvedDate ?? '')],
-                        ['uid', String(form.uid ?? '')],
-                    ];
-                    if (build)
-                        fields.push(['resolvedBuild', build]);
-                    if (a.impact || form.changeImpact)
-                        fields.push(['changeImpact', String(a.impact || form.changeImpact || '')]);
-                    if (a.comment)
-                        fields.push(['comment', String(a.comment)]);
-                    if (a.detail)
-                        fields.push(['detail_reason', String(a.detail)]);
-                    const required = Array.isArray(form.requiredFields) ? form.requiredFields : [];
-                    const requiredSet = new Set(required);
-                    const absentRequired = required.filter((r) => !fields.some(([k]) => k === r));
-                    const emptyRequired = fields.filter(([k, v]) => requiredSet.has(k) && !v).map(([k]) => k);
-                    const missingRequired = [...absentRequired, ...emptyRequired];
-                    // 禅道字段硬约束（超长/为空只会回 alert、状态不变）→ 提交前先本地拦截
-                    const problems = validateZentaoResolveFields(fields);
-                    if (a.dryRun) {
-                        return { ok: true, dryRun: true, bugID, status, fields, required, missingRequired, problems, url: viewUrl };
-                    }
-                    if (missingRequired.length > 0) {
-                        return { ok: false, bugID, status, fields, required, missingRequired, problems, url: viewUrl, message: `必填项为空，未提交：${missingRequired.join(', ')}` };
-                    }
-                    if (problems.length > 0) {
-                        return { ok: false, bugID, status, fields, required, missingRequired, problems, url: viewUrl, message: `本地校验未通过，未提交：${problems.join('；')}` };
-                    }
-                    const body = fields
-                        .filter(([, v]) => v !== undefined && v !== null && v !== '')
-                        .map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v))
-                        .join('&');
-                    const postResp = await forward('POST', formUrl, { 'Content-Type': 'application/x-www-form-urlencoded' }, body);
-                    maybeThrow(postResp, '提交失败');
-                    const postBody = String(postResp.body ?? '');
-                    const afterResp = await forward('GET', viewUrl);
-                    const afterStatus = currentStatus(String(afterResp.body ?? ''));
-                    if (afterStatus === '已解决') {
-                        return { ok: true, bugID, status: afterStatus, message: '成功，Bug 已解决', url: viewUrl };
-                    }
-                    // 服务端拒绝时响应体里带 alert('…')：原样回显，避免只报「状态异常」而无从下手
-                    const serverError = zenTaoAlertMessage(postBody);
-                    if (serverError) {
-                        return { ok: false, bugID, status: afterStatus || status, fields, problems, url: viewUrl, serverError, body: postBody.slice(0, 500), message: `服务端拒绝：${serverError}` };
-                    }
-                    return { ok: false, bugID, status: afterStatus || '未知', message: '提交完成但状态校验异常，请打开页面确认', url: viewUrl, body: postBody.slice(0, 500) };
-                };
-                return await submitOnce();
-            }
-            catch (e) {
-                return { error: e instanceof Error ? e.message : String(e) };
-            }
-        },
-    }));
+        }));
+    }
+    catch (error) {
+        ctx.logger?.warn?.(`[dsh-tool-fetch-page] 跳过历史工具 zentao_resolve_bug（名字已被占用）：${error instanceof Error ? error.message : String(error)}`);
+    }
 }
 //# sourceMappingURL=index.js.map
