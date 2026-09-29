@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-tool-fetch-page",
   "description": "Model-facing fetch_page tool that forwards HTTP requests through the local browser-extension relay daemon (cookie-bearing, CORS-free)",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -18,9 +18,7 @@
   ],
   "license": "MIT",
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-shell": "^0.1.2-rc.1 || >=0.1.6-alpha.1 <0.2",
-    "@deepseek-ai/dsh-tools": "^0.1.2-rc.1 || >=0.1.6-alpha.1 <0.2"
+    "@deepseek-ai/cordis": "^4.0.2"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
