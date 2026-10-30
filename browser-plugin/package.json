@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-tool-browser",
-  "description": "Model-facing browser tool that drives the user's running Chrome through the local browser-harness CLI (CDP, login-state preserved)",
-  "version": "0.1.0",
+  "description": "Model-facing browser tools for the already-logged-in Chrome. chrome_* tools drive Chrome through an in-process CDP hub (one persistent connection, so one authorization per Chrome session); legacy browser/verify_page still use browser-harness.",
+  "version": "0.2.0",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -14,7 +14,9 @@
   },
   "files": [
     "lib/index.js",
-    "lib/types/**/*.d.ts"
+    "lib/hub/**/*.js",
+    "lib/types/**/*.d.ts",
+    "resources/cdp-hub.mjs"
   ],
   "license": "MIT",
   "peerDependencies": {

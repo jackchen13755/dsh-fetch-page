@@ -21,5 +21,11 @@ export interface Config {
     workdir?: string;
     /** Sandbox workspace root for the shell command. */
     workspaceRoot?: string;
+    /** cdp-hub 本地侧车端口（0 = 不开 HTTP 侧车），默认 9334。 */
+    port?: number;
+    /** Chrome 用户数据目录（默认按平台推断：mac / win / linux）。 */
+    profileDir?: string;
+    /** 直接指定 CDP WebSocket 地址（优先于 profileDir）。 */
+    cdpWsUrl?: string;
 }
 export declare function apply(ctx: Context, config?: Config): void;

@@ -204,6 +204,28 @@ verify_page url=http://localhost:3000/orders \
 `count` / `attribute` / `style`。可选 `screenshot=true` 始终截图、`fail_on_console_errors=true`
 让 console error 也判定失败。
 
+### 驱动已登录 Chrome（`chrome_*` 工具，推荐）
+
+`browser-plugin` 还内置了一个 **CDP 中枢**：插件进程内持有唯一一条到用户主 Chrome 的连接，
+所以「要允许远程调试吗」这个弹窗**每个 Chrome 会话只出现一次**（Chrome 的授权粒度是
+一条 WebSocket 一次，任何脚本自己直连都会每次弹一次）。
+
+| 工具 | 参数 | 作用 |
+| --- | --- | --- |
+| `chrome_hub` | `action: status \| start \| stop` | 起停与健康检查；`connects` 是累计授权次数（应恒为 1） |
+| `chrome_cookies` | `domains?`, `includeValues?`, `limit?` | 取主 Chrome cookie；默认只给元信息，不把 value 送进上下文 |
+| `chrome_page` | `url`, `expr?`, `waitForSelector?`, `capture?`, `screenshotPath?`, `keep?` | 开页 → 等 → 求值 → 截图；`capture` 抓响应体（等价旧 `probe.js --capture`） |
+| `chrome_cdp` | `method`, `params?`, `targetId?`/`sessionId?` | 任意 CDP 方法兜底；给 `targetId` 会自动 attach |
+
+要点：
+
+- **不依赖 browser-harness、不依赖任何 /tmp 脚本**，装上插件就可用；Chrome 用户数据目录按平台自动识别（mac / win / linux），也可用配置 `profileDir` 或环境变量 `CDP_PROFILE_DIR` 覆盖，或用 `cdpWsUrl` 直接指定端点。
+- 插件同时在 `127.0.0.1:9334` 开 HTTP 侧车：`/health` `/cookies` `/targets` `/cdp` `/attach` `/events`（SSE）。**bash 里的脚本**直接打这个端口就能复用同一条连接。
+- 端口被占用时会先探 `/health`：是同类 hub 就复用（`external: true`），不是则报可操作的错误。
+- 插件卸载 / 宿主退出时自动关连接、关端口（挂在 `ctx.effect` 上）。
+- 没装插件的机器可以用同一个实现起 CLI：`node resources/cdp-hub.mjs`（零外部依赖，仅需 Node ≥ 18）。
+- 旧的 `browser` / `verify_page` 仍保留（走 browser-harness CLI），但只作为没有 hub 时的兜底。
+
 ### Figma WS 静默捕获（零 REST API）
 
 扩展 v1.4.0 起，打开/刷新任意 `figma.com/design|file|proto` 页面时，会在后台静默捕获

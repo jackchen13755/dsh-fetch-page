@@ -13,6 +13,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { ChromeHub } from './hub/index.js';
 export const name = 'tool-browser';
 export const inject = ['tools', 'shell'];
 /** A single model-facing text content block. */
@@ -395,6 +396,249 @@ export function apply(ctx, config = {}) {
                 }
                 catch { /* noop */ }
                 return { error: error instanceof Error ? error.message : String(error) };
+            }
+        },
+    }));
+    // ───────────────────────────────────────────────────────────────────────────
+    // cdp-hub 系列：插件进程内持有**唯一**一条到用户主 Chrome 的 CDP 连接。
+    // 授权粒度是「一条 WebSocket 一次」，所以复用同一条连接才能让
+    // 「要允许远程调试吗」压到每个 Chrome 会话一次；同时开 127.0.0.1 侧车，
+    // 让插件之外的脚本（bash + node/curl）也能复用这条连接。
+    // ───────────────────────────────────────────────────────────────────────────
+    const hub = new ChromeHub({
+        ...(config.port !== undefined ? { port: config.port } : {}),
+        ...(config.profileDir !== undefined ? { profileDir: config.profileDir } : {}),
+        ...(config.cdpWsUrl !== undefined ? { cdpWsUrl: config.cdpWsUrl } : {}),
+    });
+    ctx.effect(() => () => {
+        void hub.stop();
+    }, 'tool-browser: cdp hub');
+    /** 去掉 undefined 字段：宿主按 output.schema 校验，脏字段会让整次调用失败。 */
+    /** 把任意结果归一化成纯 JSON（去 undefined、剥不可序列化对象）。 */
+    function jsonResult(value) {
+        let text;
+        try {
+            text = JSON.stringify(value ?? null);
+        }
+        catch {
+            text = JSON.stringify({ ok: false, error: '结果不可序列化' });
+        }
+        return JSON.parse(text);
+    }
+    function okJson(bag) {
+        return jsonResult({ ok: true, ...bag });
+    }
+    function errJson(error, tag) {
+        const message = error instanceof Error ? error.message : String(error);
+        return jsonResult({ ok: false, ...(tag ?? {}), error: message });
+    }
+    function jsonBlock(value) {
+        return textBlock(JSON.stringify(value, null, 2));
+    }
+    ctx.tools.register(defineTool({
+        name: 'chrome_hub',
+        description: '管理「本机已登录 Chrome」的 CDP 中枢（插件进程内常驻一条连接，登录态/权限留在真实浏览器里）。' +
+            'action=status 看状态（connects 是累计授权次数，正常人应一直是 1）；start 建立/确保连接；stop 断开并关掉本地侧车。' +
+            '首次连接时 Chrome 会弹「要允许远程调试吗」，点允许即可（此后每个 Chrome 会话只需一次）。',
+        parameters: {
+            action: {
+                type: 'string',
+                required: true,
+                description: 'status（默认查询）| start（确保连接并开侧车）| stop（断开）',
+            },
+        },
+        output: {
+            schema: {
+                type: 'object',
+                additionalProperties: true,
+                properties: {
+                    ok: { type: 'boolean' },
+                    action: { type: 'string' },
+                    ready: { type: 'boolean' },
+                    external: { type: 'boolean' },
+                    port: { type: 'number' },
+                    baseUrl: { type: 'string' },
+                    connects: { type: 'number' },
+                    disconnects: { type: 'number' },
+                    requests: { type: 'number' },
+                    errors: { type: 'number' },
+                    uptimeSec: { type: 'number' },
+                },
+            },
+            render(_args, value) {
+                return [jsonBlock(value)];
+            },
+        },
+        async execute(args) {
+            const action = typeof args.action === 'string' ? args.action : 'status';
+            try {
+                if (action === 'stop') {
+                    await hub.stop();
+                    return okJson({ action, ready: false });
+                }
+                if (action === 'start') {
+                    const status = await hub.ensure();
+                    return jsonResult({
+                        ok: status.ready,
+                        action,
+                        ...status,
+                        ...(status.ready
+                            ? {}
+                            : { hint: '若 Chrome 弹了「要允许远程调试吗」，请点允许后重试；也可先确认 chrome://inspect/#remote-debugging 已开启。' }),
+                    });
+                }
+                const status = await hub.status();
+                return okJson({ action, ...status });
+            }
+            catch (error) {
+                return errJson(error, { action });
+            }
+        },
+    }));
+    ctx.tools.register(defineTool({
+        name: 'chrome_cookies',
+        description: '读取用户已登录 Chrome 的 cookie（走插件内的 CDP 中枢，不会新建连接、不会弹授权）。' +
+            '默认只返回统计与条目元信息（域名/名称/路径/Secure/HttpOnly），不返回 value，避免密钥进上下文；' +
+            '确实需要值时才把 includeValues 设为 true。适合把登录态导出给别的浏览器实例 / 直连接口取证。',
+        parameters: {
+            domains: {
+                type: 'string',
+                description: '可选：按域名子串过滤，逗号分隔，如 "example.com,api.example.com"；不传=全量统计。',
+            },
+            includeValues: { type: 'boolean', description: '是否返回 cookie 的 value（默认 false）。' },
+            limit: { type: 'number', description: '最多返回多少条明细，默认 50。' },
+        },
+        output: {
+            schema: {
+                type: 'object',
+                additionalProperties: true,
+                properties: {
+                    ok: { type: 'boolean' },
+                    total: { type: 'number' },
+                    domains: { type: 'number' },
+                    samples: { type: 'array' },
+                },
+            },
+            render(_args, value) {
+                return [jsonBlock(value)];
+            },
+        },
+        async execute(args) {
+            try {
+                const domains = typeof args.domains === 'string' ? args.domains : undefined;
+                const includeValues = args.includeValues === true;
+                const limit = typeof args.limit === 'number' && args.limit > 0 ? Math.min(args.limit, 500) : 50;
+                const { summary, cookies } = await hub.cookies(domains);
+                const samples = cookies.slice(0, limit).map((c) => ({
+                    name: c.name,
+                    domain: c.domain,
+                    path: c.path ?? '/',
+                    secure: c.secure === true,
+                    httpOnly: c.httpOnly === true,
+                    ...(includeValues ? { value: c.value } : {}),
+                }));
+                return okJson({ ...summary, samples });
+            }
+            catch (error) {
+                return errJson(error);
+            }
+        },
+    }));
+    ctx.tools.register(defineTool({
+        name: 'chrome_page',
+        description: '在用户真实已登录的 Chrome 里开一个标签页：导航 → 等待（readyState 或选择器）→ 执行表达式 → 可选截图/抓响应体 → 关标签页。' +
+            '走插件内的 CDP 中枢，不新建到 Chrome 的连接。表达式里可用 await，需自己写 return（会被包进 async IIFE）。' +
+            'capture 传一个 URL 子串即可抓取匹配响应的响应体键名/片段（等价旧 probe.js 的 --capture）。',
+        parameters: {
+            url: { type: 'string', required: true, description: '要打开的地址（本地 dev server 或线上页面）' },
+            expr: { type: 'string', description: '在页面里执行的 JS 片段；可用 await，需自己 return。' },
+            waitForSelector: { type: 'string', description: '可选：等该 CSS 选择器出现后再继续（SPA 渲染）。' },
+            capture: { type: 'string', description: '可选：抓取 URL 含该子串的响应体（只回键名或前 500 字）。' },
+            screenshotPath: { type: 'string', description: '可选：整页截图保存路径（绝对路径）。' },
+            timeoutMs: { type: 'number', description: '加载/等待超时毫秒，默认 60000。' },
+            keep: { type: 'boolean', description: '为 true 则不关闭标签页（默认关闭）。' },
+            width: { type: 'number', description: '视口宽，默认 1600。' },
+            height: { type: 'number', description: '视口高，默认 1200。' },
+        },
+        output: {
+            schema: {
+                type: 'object',
+                additionalProperties: true,
+                properties: {
+                    ok: { type: 'boolean' },
+                    url: { type: 'string' },
+                    title: { type: 'string' },
+                    readyState: { type: 'string' },
+                    captured: { type: 'array' },
+                    consoleErrors: { type: 'array' },
+                    networkFailures: { type: 'array' },
+                },
+            },
+            render(_args, value) {
+                return [jsonBlock(value)];
+            },
+        },
+        async execute(args) {
+            try {
+                const url = typeof args.url === 'string' ? args.url : '';
+                if (url === '')
+                    return errJson('url 必填');
+                const result = await hub.page({
+                    url,
+                    ...(typeof args.expr === 'string' ? { expr: args.expr } : {}),
+                    ...(typeof args.waitForSelector === 'string' ? { waitForSelector: args.waitForSelector } : {}),
+                    ...(typeof args.capture === 'string' ? { capture: args.capture } : {}),
+                    ...(typeof args.screenshotPath === 'string' ? { screenshotPath: args.screenshotPath } : {}),
+                    ...(typeof args.timeoutMs === 'number' ? { timeoutMs: args.timeoutMs } : {}),
+                    ...(args.keep === true ? { keep: true } : {}),
+                    viewport: {
+                        width: typeof args.width === 'number' ? args.width : 1600,
+                        height: typeof args.height === 'number' ? args.height : 1200,
+                    },
+                });
+                return jsonResult(result);
+            }
+            catch (error) {
+                return errJson(error);
+            }
+        },
+    }));
+    ctx.tools.register(defineTool({
+        name: 'chrome_cdp',
+        description: '直接发一条 CDP 命令给用户已登录的 Chrome（高级/兜底：探针、特殊域、或 chrome_page 覆盖不到的场景）。' +
+            '给 targetId 会自动 attach 并注入 sessionId；也可显式传 sessionId 复用已有页会话语境。',
+        parameters: {
+            method: { type: 'string', required: true, description: 'CDP 方法名，如 "Target.getTargets"、"Page.navigate"。' },
+            params: { type: 'object', additionalProperties: true, description: 'CDP 参数对象。' },
+            targetId: { type: 'string', description: '可选：先 attach 到该 target，再把返回的 sessionId 用于本次命令。' },
+            sessionId: { type: 'string', description: '可选：直接指定已 attach 的 sessionId。' },
+        },
+        output: {
+            schema: { type: 'object', additionalProperties: true },
+            render(_args, value) {
+                return [jsonBlock(value)];
+            },
+        },
+        async execute(args) {
+            try {
+                const method = typeof args.method === 'string' ? args.method : '';
+                if (method === '')
+                    return errJson('method 必填');
+                const params = args.params ?? {};
+                let sessionId = typeof args.sessionId === 'string' ? args.sessionId : undefined;
+                const targetId = typeof args.targetId === 'string' ? args.targetId : undefined;
+                let attachedSession;
+                if (sessionId === undefined && targetId !== undefined) {
+                    const attached = (await hub.call('Target.attachToTarget', { targetId, flatten: true }));
+                    attachedSession = attached.sessionId;
+                    if (attachedSession !== undefined)
+                        sessionId = attachedSession;
+                }
+                const result = await hub.call(method, params, sessionId);
+                return okJson({ method, result });
+            }
+            catch (error) {
+                return errJson(error);
             }
         },
     }));
