@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-tool-browser",
   "description": "Model-facing browser tools for the already-logged-in Chrome. chrome_* tools drive Chrome through an in-process CDP hub (one persistent connection, so one authorization per Chrome session); legacy browser/verify_page still use browser-harness.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -16,9 +16,16 @@
     "lib/index.js",
     "lib/hub/**/*.js",
     "lib/types/**/*.d.ts",
-    "resources/cdp-hub.mjs"
+    "resources/cdp-hub.mjs",
+    "cordis.patch.yml"
   ],
   "license": "MIT",
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-shell": "^0.1.0-rc.5 || >=0.1.6-alpha.1 <0.2",

@@ -1,0 +1,9 @@
+# dsh-tool-browser bundle patch: inserts the plugin row into the composition.
+# Later layers (profile cordis.patch.yml, --patch) may override this row by id.
+#
+# 为什么加这个文件：宿主装/装配时会剪掉「未声明 dsh 元数据」的 bundles 条目——
+# 插件装得上、市场里显示「已安装，未生效」，功能全部消失。声明 dsh.bundle.patch
+# 之后它才被当作 bundle 插件对待，条目不再被剪。
+- insert:
+    - id: tool-browser
+      name: '@deepseek-ai/dsh-tool-browser'
