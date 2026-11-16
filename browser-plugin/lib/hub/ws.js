@@ -8,6 +8,10 @@
  * 覆盖范围：握手、masked 文本帧发送、分片接收、ping/pong、close。
  * 不支持：扩展（permessage-deflate）、二进制帧的业务使用（仅忽略）。
  *
+ * 错误语义：握手阶段失败（未拿到 101 / 101 之前被对端关闭 / 握手超时）会带
+ * `code = 'ws-handshake'` 与 `stage`（status/closed/timeout），上层据此判定
+ * 「授权未获准」并立即暂停自动重连——不然每次重试都是一次新的授权弹窗。
+ *
  * @module @deepseek-ai/dsh-tool-browser/hub/ws
  */
 import { randomBytes } from 'node:crypto';
@@ -16,6 +20,17 @@ const OP_TEXT = 0x1;
 const OP_CLOSE = 0x8;
 const OP_PING = 0x9;
 const OP_PONG = 0xa;
+function handshakeError(stage, message) {
+    const error = new Error(message);
+    error.code = 'ws-handshake';
+    error.stage = stage;
+    return error;
+}
+function transportError(message) {
+    const error = new Error(message);
+    error.code = 'ws-tcp';
+    return error;
+}
 export class MiniWebSocket {
     socket = null;
     buf = Buffer.alloc(0);
@@ -34,6 +49,8 @@ export class MiniWebSocket {
             throw new Error(`只支持 ws:// 端点，收到 ${url.protocol}`);
         const host = url.hostname;
         const port = Number(url.port || 80);
+        // 错误文本只带 host:port：devtools/browser/<uuid> 不该进日志/health.lastError
+        const where = `${host}:${port}`;
         const pathPart = `${url.pathname || '/'}${url.search}`;
         const key = randomBytes(16).toString('base64');
         const timeoutMs = opts.timeoutMs ?? 15000;
@@ -42,20 +59,26 @@ export class MiniWebSocket {
         ws.socket = socket;
         socket.setNoDelay(true);
         return new Promise((resolve, reject) => {
+            let settled = false;
             const timer = setTimeout(() => {
                 socket.destroy();
-                reject(new Error(`连接 Chrome CDP 超时（${timeoutMs}ms）：${urlStr}`));
+                reject(handshakeError('timeout', `CDP 握手超时（${timeoutMs}ms，${where}）：Chrome 没有在窗口内完成 WebSocket 握手`));
             }, timeoutMs);
             timer.unref?.();
-            const fail = (err) => {
+            const failed = (error) => {
+                if (settled)
+                    return;
+                settled = true;
                 clearTimeout(timer);
                 socket.destroy();
-                reject(err);
+                reject(error);
             };
-            socket.once('error', fail);
+            socket.once('error', (error) => {
+                failed(ws.handshakeResolved ? transportError(error.message) : transportError(`连接 ${where} 失败：${error.message}`));
+            });
             socket.once('connect', () => {
                 socket.write(`GET ${pathPart} HTTP/1.1\r\n` +
-                    `Host: ${host}:${port}\r\n` +
+                    `Host: ${where}\r\n` +
                     'Upgrade: websocket\r\n' +
                     'Connection: Upgrade\r\n' +
                     `Sec-WebSocket-Key: ${key}\r\n` +
@@ -73,12 +96,13 @@ export class MiniWebSocket {
                     ws.buf = ws.buf.subarray(end + 4);
                     const statusLine = head.split('\r\n')[0] ?? '';
                     if (!/^HTTP\/1\.1 101/.test(statusLine)) {
-                        fail(new Error(`WebSocket 握手失败：${statusLine}`));
+                        failed(handshakeError('status', `WebSocket 握手失败（${where}）：${statusLine}`));
                         return;
                     }
                     ws.handshakeResolved = true;
+                    settled = true;
                     clearTimeout(timer);
-                    socket.removeListener('error', fail);
+                    socket.removeAllListeners('error');
                     socket.on('error', (e) => ws.finish(undefined, e.message));
                     resolve(ws);
                     ws.pump();
@@ -87,7 +111,16 @@ export class MiniWebSocket {
                 ws.pump();
             };
             socket.on('data', onData);
-            socket.on('close', () => ws.finish());
+            // 关键：握手窗口内对端优雅关闭（FIN）必须当场 reject。
+            // 旧实现这里什么都不做，于是挂满 readyTimeoutMs（生产 30s）才超时——
+            // 用户看到的就是「界面卡死」，且 5 次重试 = 2.5 分钟 + 5 次授权弹窗机会。
+            socket.on('close', () => {
+                if (!ws.handshakeResolved) {
+                    failed(handshakeError('closed', `WebSocket 握手窗口内被对端关闭（${where}）：远程调试授权未获准或端点已失效`));
+                    return;
+                }
+                ws.finish();
+            });
         });
     }
     /** 发送一条文本消息。 */
@@ -209,8 +242,14 @@ export class MiniWebSocket {
     flushFrag() {
         const full = Buffer.concat(this.frag);
         this.frag = [];
-        if (this.fragIsText)
-            this.onText?.(full.toString('utf8'));
+        if (this.fragIsText) {
+            try {
+                this.onText?.(full.toString('utf8'));
+            }
+            catch {
+                /* 上层回调异常不能掀翻宿主 */
+            }
+        }
     }
     finish(code, reason) {
         if (this.closed)
@@ -222,7 +261,12 @@ export class MiniWebSocket {
         catch {
             /* ignore */
         }
-        this.onClose?.(code, reason);
+        try {
+            this.onClose?.(code, reason);
+        }
+        catch {
+            /* 上层回调异常不能掀翻宿主 */
+        }
     }
 }
 //# sourceMappingURL=ws.js.map

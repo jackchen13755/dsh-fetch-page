@@ -505,6 +505,11 @@ export function apply(ctx: Context, config: Config = {}): void {
           requests: { type: 'number' },
           errors: { type: 'number' },
           uptimeSec: { type: 'number' },
+          paused: { type: 'boolean' },
+          pausedReason: { type: 'string' },
+          attempts: { type: 'number' },
+          nextRetryMs: { type: 'number' },
+          keepalives: { type: 'number' },
         },
       },
       render(_args, value) {
@@ -526,7 +531,12 @@ export function apply(ctx: Context, config: Config = {}): void {
             ...status,
             ...(status.ready
               ? {}
-              : { hint: '若 Chrome 弹了「要允许远程调试吗」，请点允许后重试；也可先确认 chrome://inspect/#remote-debugging 已开启。' }),
+              : {
+                  hint:
+                    status.pausedReason === 'auth'
+                      ? 'Chrome 的远程调试授权没通过：请先点「允许」；若已允许仍失败，多半是 DevToolsActivePort 的 uuid 已过期（Chrome 重启过），重新开启远程调试后再试（授权暂停有 30s 冷却）。'
+                      : '若 Chrome 弹了「要允许远程调试吗」，请点允许后重试；也可先确认 chrome://inspect/#remote-debugging 已开启。',
+                }),
           })
         }
         const status = await hub.status()

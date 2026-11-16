@@ -27,6 +27,13 @@ export interface HubStatus {
     lastError: string | null;
     lastConnectedAt: string | null;
     uptimeSec: number;
+    /** 上游是否因连续失败/空闲而暂停自动重连（/health 的 paused）。 */
+    paused: boolean;
+    pausedReason: string | null;
+    /** 连续失败次数（握手成功清零）。 */
+    attempts: number;
+    /** 距离下一次自动重试还有多久（ms）；无排期时为 null。 */
+    nextRetryMs: number | null;
 }
 export interface PageResult {
     ok: boolean;

@@ -3,7 +3,11 @@
  * 脚本（bash 里的 node / curl）复用，从而不必各自直连 9222。
  *
  * 契约与历史 cdp-hub 保持一致：
- *   GET  /health                 → { ok, ready, connects, disconnects, requests, errors, upstream }
+ *   GET  /health                 → { ok, hub, pid, ready, paused, pausedReason, attempts,
+ *                                    nextRetryMs, endpointChanged, lastError, connects,
+ *                                    disconnects, requests, keepalives, errors, upstream,
+ *                                    source, profileDir, uptimeSec }
+ *     `ok` 是上游真实就绪状态（不再恒 true）；pid 用于区分自身与外部 hub。
  *   GET  /cookies?domains=a,b    → { total, domains, cookies }
  *   GET  /targets                → Target.getTargets
  *   GET  /events                 → SSE 事件流

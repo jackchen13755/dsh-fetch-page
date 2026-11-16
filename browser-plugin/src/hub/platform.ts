@@ -5,6 +5,10 @@
  * 唯一可靠来源就是用户数据目录下的 `DevToolsActivePort`（第 1 行端口、第 2 行
  * `/devtools/browser/<uuid>`）。各平台目录不同，这里做统一解析，避免把 macOS 路径写死。
  *
+ * 端口校验从严：只接受 1..65535 的整数。非法值一律视为「没有可用端点」，
+ * 由 `resolveEndpoint` 报可操作的错误——绝不在调用方那边静默猜一个 9222
+ * （开发机上 9222 常另有 Chrome，静默回落会连错浏览器）。
+ *
  * @module @deepseek-ai/dsh-tool-browser/hub/platform
  */
 import { existsSync, readFileSync } from 'node:fs'
@@ -18,6 +22,13 @@ export interface ResolvedEndpoint {
   source: string
   /** 命中的用户数据目录（env/config 直连时为空）。 */
   profileDir?: string
+}
+
+/** 把 home 目录缩成 `~`：错误信息/日志不该把用户名带进公开仓库的排障输出。 */
+export function prettyPath(path: string): string {
+  const home = homedir()
+  if (home === '' || home === '/') return path
+  return path.startsWith(home) ? `~${path.slice(home.length)}` : path
 }
 
 /** 各平台 Chrome 用户数据目录候选（按优先级）。 */
@@ -38,7 +49,12 @@ export function chromeProfileCandidates(): string[] {
   ]
 }
 
-/** 读 DevToolsActivePort；文件缺失或内容不完整时返回 undefined。 */
+/** 端口是否合法（1..65535 的整数）。 */
+export function isValidPort(port: number): boolean {
+  return Number.isInteger(port) && port >= 1 && port <= 65535
+}
+
+/** 读 DevToolsActivePort；文件缺失、端口非法或内容不完整时返回 undefined。 */
 export function readDevToolsActivePort(profileDir: string): { port: number; path: string } | undefined {
   const file = join(profileDir, 'DevToolsActivePort')
   if (!existsSync(file)) return undefined
@@ -54,7 +70,9 @@ export function readDevToolsActivePort(profileDir: string): { port: number; path
     .filter((s) => s !== '')
   const port = Number(lines[0])
   const wsPath = lines[1]
-  if (!Number.isFinite(port) || port <= 0 || !wsPath || !wsPath.startsWith('/')) return undefined
+  // 端口 0 / 65536 / 非整数一律非法：宁可报错，也不猜一个端口去连别的 Chrome。
+  if (lines[0] === undefined || !isValidPort(port)) return undefined
+  if (wsPath === undefined || !wsPath.startsWith('/')) return undefined
   return { port, path: wsPath }
 }
 
@@ -82,8 +100,10 @@ export function resolveEndpoint(opts: { profileDir?: string; cdpWsUrl?: string }
   }
 
   throw new Error(
-    '没有找到 Chrome 的远程调试端点。' +
-      '请在 Chrome 打开 chrome://inspect/#remote-debugging 并开启远程调试（或给插件配置 profileDir / 设置环境变量 DSH_CHROME_WS）。' +
-      `已查找的目录：${dirs.join(', ')}`,
+    '没有找到 Chrome 的远程调试端点：DevToolsActivePort 缺失、端口非法，或文件里没有 /devtools/browser/<uuid>。' +
+      '请在 Chrome 打开 chrome://inspect/#remote-debugging 并开启远程调试' +
+      '（或给插件配置 profileDir / 设置环境变量 DSH_CHROME_WS）。' +
+      `已查找的目录：${dirs.map(prettyPath).join(', ')}。` +
+      '排查提示：Chrome 重启后 DevToolsActivePort 会更新，旧文件的端口可能已无监听。',
   )
 }

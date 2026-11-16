@@ -1,3 +1,12 @@
+/** 握手阶段失败（区别于 TCP 层失败）：多半是 Chrome 的「允许远程调试吗」没被批准。 */
+export interface HandshakeFailure extends Error {
+    code: 'ws-handshake';
+    stage: 'status' | 'closed' | 'timeout';
+}
+/** TCP 层失败（端口没开、被拒绝）：可以用退避重试。 */
+export interface TransportFailure extends Error {
+    code: 'ws-tcp';
+}
 export declare class MiniWebSocket {
     private socket;
     private buf;

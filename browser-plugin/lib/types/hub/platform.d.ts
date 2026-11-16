@@ -6,9 +6,13 @@ export interface ResolvedEndpoint {
     /** 命中的用户数据目录（env/config 直连时为空）。 */
     profileDir?: string;
 }
+/** 把 home 目录缩成 `~`：错误信息/日志不该把用户名带进公开仓库的排障输出。 */
+export declare function prettyPath(path: string): string;
 /** 各平台 Chrome 用户数据目录候选（按优先级）。 */
 export declare function chromeProfileCandidates(): string[];
-/** 读 DevToolsActivePort；文件缺失或内容不完整时返回 undefined。 */
+/** 端口是否合法（1..65535 的整数）。 */
+export declare function isValidPort(port: number): boolean;
+/** 读 DevToolsActivePort；文件缺失、端口非法或内容不完整时返回 undefined。 */
 export declare function readDevToolsActivePort(profileDir: string): {
     port: number;
     path: string;

@@ -221,10 +221,54 @@ verify_page url=http://localhost:3000/orders \
 
 - **不依赖 browser-harness、不依赖任何 /tmp 脚本**，装上插件就可用；Chrome 用户数据目录按平台自动识别（mac / win / linux），也可用配置 `profileDir` 或环境变量 `CDP_PROFILE_DIR` 覆盖，或用 `cdpWsUrl` 直接指定端点。
 - 插件同时在 `127.0.0.1:9334` 开 HTTP 侧车：`/health` `/cookies` `/targets` `/cdp` `/attach` `/events`（SSE）。**bash 里的脚本**直接打这个端口就能复用同一条连接。
-- 端口被占用时会先探 `/health`：是同类 hub 就复用（`external: true`），不是则报可操作的错误。
+- 端口被占用时会先探 `/health`：是**别的进程**的同类 hub 就复用（`external: true`），不是则报可操作的错误。
+  `/health` 里带 `pid`，本进程自己的侧车不会被误当成外部 hub（否则上游死了也不会重建）。
 - 插件卸载 / 宿主退出时自动关连接、关端口（挂在 `ctx.effect` 上）。
 - 没装插件的机器可以用同一个实现起 CLI：`node resources/cdp-hub.mjs`（零外部依赖，仅需 Node ≥ 18）。
 - 旧的 `browser` / `verify_page` 仍保留（走 browser-harness CLI），但只作为没有 hub 时的兜底。
+
+#### 断线重连与 `/health`
+
+Chrome 的远程调试授权是**每条 WebSocket 一次**，所以「断线就每 1.5s 重连一次」会变成
+「每 1.5s 抢一次授权弹窗」——Mac 睡眠唤醒后尤其明显。现在 hub 的重连策略是：
+
+| 机制 | 行为 |
+| --- | --- |
+| 单飞 + 代际守卫 | 任意时刻最多一条上游 socket；close/error 回调先校验 socket 身份，旧 socket 的迟到事件直接丢弃 |
+| 指数退避 + 抖动 | `1500 → 3000 → 6000 → 12000`（默认 `maxAttempts=5`，第 5 次失败进 paused）；调大 `maxAttempts` 可继续 `24000 → 48000`，上限 `60000ms`。抖动默认 ±20%，硬上限 1/3（超过 1/3 会破坏相邻延迟单调递增） |
+| 端口预探测 | 握手前先 TCP 探 `DevToolsActivePort` 的端口（500ms）；**未监听就不发 WS 握手**（授权弹窗只由 WS 握手触发）。端口必须是 1..65535 的整数，非法即报错，**不会静默回落 9222**（开发机上 9222 常另有 Chrome，回落会连错浏览器） |
+| 端口探测与握手都跑不起来 | 连续 5 次进 `paused(failures)`，不再自动发起 WS；只有客户端显式请求（ensure / 首个 `/cdp`、`/attach`、`/cookies`、`/page`）才放行一次新尝试，带 3s 冷却，失败立刻回 paused |
+| **授权类失败**（P2） | TCP 可达但握手没成功（无 101 / 101 前被对端关闭 / 握手超时）→ **第 1 次就 `paused(auth)`**：这类失败等一会儿不会自己好，重试只会多弹一次窗。之后只有客户端显式请求（冷却 **30s**，比普通重试严 10 倍）或端点（端口/uuid）变化才放行一次尝试 |
+| 懒连接 + 空闲断开 | 10 分钟没有客户端需求就主动断开并停在 `paused(idle)`；`/events` 的活跃订阅者（含每 15s 的 ping）会续期需求，不会因为「只订阅不发请求」被饿死 |
+| keepalive 看门狗 | `Browser.getVersion` 发出后 10s 无回包/报错即判半开，`close()` 走统一重连路径（不再吞掉错误）；keepalive 单独计入 `keepalives`，不污染 `requests` |
+| 唤醒处理（P1） | 时间差 > 120s 视为系统睡过 → 重置退避并**最多重建一次**；且必须「有新鲜需求（120s 内有客户端请求）」或「唤醒前处于 ready」，否则保持 paused——**绝不为「探测」去握手**。`SIGCONT` 是进程级广播（`fg`/`bg`/`kill -CONT` 都会发），只当提示，必须由时间差证明真的睡过；`paused(auth)` 永不被唤醒解除 |
+| 结构化日志（脱敏） | 每次（重）连接尝试一行 stderr：`[cdp-hub] upstream attempt attempt=2 delayMs=1500 portListening=false endpoint=127.0.0.1:9222 source=DevToolsActivePort`。日志与 `health.lastError` 里 `<uuid>` 只保留前 8 位，home 目录缩成 `~` |
+
+`GET /health` 不再恒为 `ok: true`——`ok` 就是上游真实就绪状态，并新增排障字段：
+
+```json
+{
+  "ok": false, "hub": true, "pid": 12345,
+  "ready": false, "paused": true, "pausedReason": "auth",
+  "attempts": 1, "nextRetryMs": null, "endpointChanged": false,
+  "lastError": "WebSocket 握手失败（127.0.0.1:9222）：HTTP/1.1 403 Forbidden",
+  "connects": 3, "disconnects": 3, "requests": 0, "keepalives": 0, "errors": 1,
+  "upstream": "ws://127.0.0.1:9222/devtools/browser/<uuid>", "source": "DevToolsActivePort",
+  "profileDir": "…", "uptimeSec": 128
+}
+```
+
+`pausedReason` 取值：`failures`（网络/端点类连续失败）、`auth`（授权未获准）、`idle`（空闲断开）。
+
+其余路由（`/cookies` `/targets` `/json/version` `/json/list` `/cdp` `/attach` `/events`）的路径与
+返回结构保持不变。
+
+重连行为的回归测试在仓库根 `test/`（`node:test`，不联网、不碰真实 Chrome、时间参数压缩到毫秒）：
+
+```bash
+npm test            # = node --test test/
+node --test test/   # 86 个用例：upstream / server / index / ws / platform
+```
 
 ### Figma WS 静默捕获（零 REST API）
 

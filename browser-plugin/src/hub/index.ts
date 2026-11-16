@@ -43,6 +43,13 @@ export interface HubStatus {
   lastError: string | null
   lastConnectedAt: string | null
   uptimeSec: number
+  /** 上游是否因连续失败/空闲而暂停自动重连（/health 的 paused）。 */
+  paused: boolean
+  pausedReason: string | null
+  /** 连续失败次数（握手成功清零）。 */
+  attempts: number
+  /** 距离下一次自动重试还有多久（ms）；无排期时为 null。 */
+  nextRetryMs: number | null
 }
 
 export interface PageResult {
@@ -72,6 +79,21 @@ async function probeHealth(baseUrl: string, timeoutMs = 1200): Promise<Record<st
   } catch {
     return null
   }
+}
+
+/** 像 CDP hub 的 /health（新老版本都认：pid 或 ready 字段）。 */
+function isHubHealth(health: Record<string, unknown> | null): health is Record<string, unknown> {
+  if (health === null) return false
+  return typeof health['pid'] === 'number' || typeof health['ready'] === 'boolean'
+}
+
+/**
+ * 只有**别的进程**上的 hub 才能当外部 hub 复用（S8）。
+ * 同 pid 说明是本进程自己的侧车：继续走本地上游，才能在上游死掉时重建，
+ * 否则 externalBase 指向自己、call() 只会一直抛「CDP 上游未就绪」。
+ */
+function isForeignHub(health: Record<string, unknown> | null): health is Record<string, unknown> {
+  return isHubHealth(health) && health['pid'] !== process.pid
 }
 
 export class ChromeHub {
@@ -106,7 +128,7 @@ export class ChromeHub {
     // 绝不能先去连 Chrome：那会多建一条 WebSocket，让 Chrome 白弹一次授权。
     if (this.port > 0) {
       const health = await probeHealth(`http://127.0.0.1:${this.port}`)
-      if (health !== null && health['ok'] === true) {
+      if (isForeignHub(health)) {
         this.externalBase = `http://127.0.0.1:${this.port}`
         return this.statusFromExternal(health)
       }
@@ -114,7 +136,7 @@ export class ChromeHub {
 
     if (this.externalBase) {
       const health = await probeHealth(this.externalBase)
-      if (health) return this.statusFromExternal(health)
+      if (isForeignHub(health)) return this.statusFromExternal(health)
       this.externalBase = null
     }
 
@@ -143,7 +165,7 @@ export class ChromeHub {
         if (error.code === 'EADDRINUSE') {
           // 端口已被占用：先看是不是同类 hub，是就复用，别抢
           void probeHealth(`http://127.0.0.1:${this.port}`).then((health) => {
-            if (health) {
+            if (isHubHealth(health)) {
               this.externalBase = `http://127.0.0.1:${this.port}`
               resolve()
               return
@@ -185,6 +207,10 @@ export class ChromeHub {
       lastError: null,
       lastConnectedAt: null,
       uptimeSec: Math.round((Date.now() - this.startedAt) / 1000),
+      paused: false,
+      pausedReason: null,
+      attempts: 0,
+      nextRetryMs: null,
     }
     if (this.externalBase) {
       const health = await probeHealth(this.externalBase)
@@ -199,6 +225,10 @@ export class ChromeHub {
       source: upstream.endpoint?.source ?? null,
       profileDir: upstream.endpoint?.profileDir ?? null,
       ...upstream.stats,
+      paused: upstream.health.paused,
+      pausedReason: upstream.health.pausedReason,
+      attempts: upstream.health.attempts,
+      nextRetryMs: upstream.health.nextRetryMs,
     }
   }
 
@@ -220,6 +250,10 @@ export class ChromeHub {
       lastError: str(health.lastError),
       lastConnectedAt: str(health.lastConnectedAt),
       uptimeSec: num(health.uptimeSec),
+      paused: health.paused === true,
+      pausedReason: str(health.pausedReason),
+      attempts: num(health.attempts),
+      nextRetryMs: typeof health.nextRetryMs === 'number' ? health.nextRetryMs : null,
     }
   }
 
@@ -241,7 +275,15 @@ export class ChromeHub {
   async call(method: string, params: Record<string, unknown> = {}, sessionId?: string): Promise<unknown> {
     const status = await this.ensure()
     if (!status.ready) {
-      throw new Error(`CDP 上游未就绪：${status.lastError ?? '未知原因'}（connects=${status.connects}）`)
+      const paused = status.paused
+        ? `已暂停自动重连（${status.pausedReason ?? 'paused'}，连续失败 ${status.attempts} 次）`
+        : '未就绪'
+      const next =
+        status.nextRetryMs === null ? '' : `，${Math.max(1, Math.ceil(status.nextRetryMs / 1000))}s 后自动重试`
+      throw new Error(
+        `CDP 上游${paused}：${status.lastError ?? '未知原因'}（connects=${status.connects}${next}）。` +
+          '若 Chrome 弹过「要允许远程调试吗」，请先点允许；或用 chrome_hub(action:"start") 重试。',
+      )
     }
     if (this.externalBase) {
       const res = await fetch(`${this.externalBase}/cdp`, {

@@ -3,7 +3,11 @@
  * 脚本（bash 里的 node / curl）复用，从而不必各自直连 9222。
  *
  * 契约与历史 cdp-hub 保持一致：
- *   GET  /health                 → { ok, ready, connects, disconnects, requests, errors, upstream }
+ *   GET  /health                 → { ok, hub, pid, ready, paused, pausedReason, attempts,
+ *                                    nextRetryMs, endpointChanged, lastError, connects,
+ *                                    disconnects, requests, keepalives, errors, upstream,
+ *                                    source, profileDir, uptimeSec }
+ *     `ok` 是上游真实就绪状态（不再恒 true）；pid 用于区分自身与外部 hub。
  *   GET  /cookies?domains=a,b    → { total, domains, cookies }
  *   GET  /targets                → Target.getTargets
  *   GET  /events                 → SSE 事件流
@@ -86,14 +90,28 @@ export function createHubServer(upstream: CdpUpstream, info: () => { startedAt: 
 
     if (method === 'GET' && url.pathname === '/health') {
       const endpoint = upstream.endpoint
+      const health = upstream.health
+      // S8：ok 不再恒 true——它就是上游真实就绪状态；paused/attempts/nextRetryMs 让
+      // 脚本能区分「hub 活着但上游暂停」和「已连上」。pid 用于区分自身与外部 hub。
       sendJson(res, 200, {
-        ok: true,
-        ready: upstream.isReady,
+        ...upstream.stats,
+        ok: health.ready,
+        hub: true,
+        pid: process.pid,
+        ready: health.ready,
+        paused: health.paused,
+        pausedReason: health.pausedReason,
+        attempts: health.attempts,
+        lastError: health.lastError,
+        nextRetryMs: health.nextRetryMs,
+        // P15：README/JSDoc 承诺过的字段必须真的返回（授权暂停时用来判断端点是否变了）。
+        endpointChanged: health.endpointChanged,
+        lastAttemptAt: health.lastAttemptAt,
+        idleForMs: health.idleForMs,
         upstream: endpoint?.wsUrl ?? null,
         source: endpoint?.source ?? null,
         profileDir: endpoint?.profileDir ?? null,
         uptimeSec: Math.round((Date.now() - info().startedAt) / 1000),
-        ...upstream.stats,
       })
       return
     }
@@ -126,7 +144,11 @@ export function createHubServer(upstream: CdpUpstream, info: () => { startedAt: 
       })
       res.write(': connected\n\n')
       sseClients.add(res)
+      // P7：纯 /events 订阅者不会调用 send()，必须在这里续期「客户端需求」，
+      // 否则一次断线会走 pause(idle) 后永不恢复，而客户端看到的现象是「流还开着」。
+      upstream.noteDemand()
       const ping = setInterval(() => {
+        upstream.noteDemand()
         try {
           res.write(': ping\n\n')
         } catch {

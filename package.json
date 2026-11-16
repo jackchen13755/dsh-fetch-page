@@ -1,0 +1,8 @@
+{
+  "name": "dsh-fetch-page-workspace",
+  "private": true,
+  "description": "Workspace-level test entry for the browser plugin (the plugin itself lives in browser-plugin/).",
+  "scripts": {
+    "test": "node --test test/"
+  }
+}
