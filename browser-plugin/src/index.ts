@@ -17,6 +17,15 @@ import type { ShellRunResult } from '@deepseek-ai/dsh-shell'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { ChromeHub } from './hub/index.js'
+import {
+  BROWSER_OUTPUT_SCHEMA,
+  CHROME_CDP_OUTPUT_SCHEMA,
+  CHROME_COOKIES_OUTPUT_SCHEMA,
+  CHROME_HUB_OUTPUT_SCHEMA,
+  CHROME_PAGE_OUTPUT_SCHEMA,
+  VERIFY_PAGE_OUTPUT_SCHEMA,
+  hubStatusOutput,
+} from './hub/tool-schemas.js'
 
 export const name = 'tool-browser'
 export const inject = ['tools', 'shell']
@@ -264,15 +273,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       code: { type: 'string', required: true, description: '要执行的 Python 片段（browser-harness -c 的内容）；helper 已预导入。' },
     },
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: true,
-        properties: {
-          stdout: { type: 'string' },
-          stderr: { type: 'string' },
-          exitCode: { type: 'number' },
-        },
-      },
+      schema: BROWSER_OUTPUT_SCHEMA,
       render(_args, value) {
         const out = typeof value.stdout === 'string' ? value.stdout : ''
         const err = typeof value.stderr === 'string' ? value.stderr : ''
@@ -336,22 +337,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       fail_on_console_errors: { type: 'boolean', description: '有 console error 时是否判定失败，默认 false（只收集报告）' },
     },
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: true,
-        properties: {
-          ok: { type: 'boolean' },
-          url: { type: 'string' },
-          title: { type: 'string' },
-          assertions: { type: 'array' },
-          consoleErrors: { type: 'array' },
-          networkErrors: { type: 'array' },
-          screenshot: { type: 'string' },
-          error: { type: 'string' },
-          stdout: { type: 'string' },
-          stderr: { type: 'string' },
-        },
-      },
+      schema: VERIFY_PAGE_OUTPUT_SCHEMA,
       render(_args, value) {
         if (value.error !== undefined) return [textBlock(`验证失败: ${value.error}`)]
         const ok = value.ok === true
@@ -490,28 +476,9 @@ export function apply(ctx: Context, config: Config = {}): void {
       },
     },
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: true,
-        properties: {
-          ok: { type: 'boolean' },
-          action: { type: 'string' },
-          ready: { type: 'boolean' },
-          external: { type: 'boolean' },
-          port: { type: 'number' },
-          baseUrl: { type: 'string' },
-          connects: { type: 'number' },
-          disconnects: { type: 'number' },
-          requests: { type: 'number' },
-          errors: { type: 'number' },
-          uptimeSec: { type: 'number' },
-          paused: { type: 'boolean' },
-          pausedReason: { type: 'string' },
-          attempts: { type: 'number' },
-          nextRetryMs: { type: 'number' },
-          keepalives: { type: 'number' },
-        },
-      },
+      // 契约在 hub/tool-schemas.ts：可空字段用 oneOf(...,null)，覆盖
+      // ready / paused(auth|failures|idle) / connecting 全部状态。
+      schema: CHROME_HUB_OUTPUT_SCHEMA,
       render(_args, value) {
         return [jsonBlock(value)]
       },
@@ -521,26 +488,26 @@ export function apply(ctx: Context, config: Config = {}): void {
       try {
         if (action === 'stop') {
           await hub.stop()
-          return okJson({ action, ready: false })
+          // 停止成功也算 ok=true，但 ready 必须如实为 false。
+          return jsonResult(hubStatusOutput(action, await hub.status(), { ok: true, ready: false }))
         }
         if (action === 'start') {
           const status = await hub.ensure()
-          return jsonResult({
-            ok: status.ready,
-            action,
-            ...status,
-            ...(status.ready
-              ? {}
-              : {
-                  hint:
-                    status.pausedReason === 'auth'
-                      ? 'Chrome 的远程调试授权没通过：请先点「允许」；若已允许仍失败，多半是 DevToolsActivePort 的 uuid 已过期（Chrome 重启过），重新开启远程调试后再试（授权暂停有 30s 冷却）。'
-                      : '若 Chrome 弹了「要允许远程调试吗」，请点允许后重试；也可先确认 chrome://inspect/#remote-debugging 已开启。',
-                }),
-          })
+          return jsonResult(
+            hubStatusOutput(action, status, {
+              ok: status.ready,
+              ...(status.ready
+                ? {}
+                : {
+                    hint:
+                      status.pausedReason === 'auth'
+                        ? 'Chrome 的远程调试授权没通过：请先点「允许」；若已允许仍失败，多半是 DevToolsActivePort 的 uuid 已过期（Chrome 重启过），重新开启远程调试后再试（授权暂停有 30s 冷却）。'
+                        : '若 Chrome 弹了「要允许远程调试吗」，请点允许后重试；也可先确认 chrome://inspect/#remote-debugging 已开启。',
+                  }),
+            }),
+          )
         }
-        const status = await hub.status()
-        return okJson({ action, ...status })
+        return jsonResult(hubStatusOutput(action, await hub.status()))
       } catch (error) {
         return errJson(error, { action })
       }
@@ -562,16 +529,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       limit: { type: 'number', description: '最多返回多少条明细，默认 50。' },
     },
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: true,
-        properties: {
-          ok: { type: 'boolean' },
-          total: { type: 'number' },
-          domains: { type: 'number' },
-          samples: { type: 'array' },
-        },
-      },
+      schema: CHROME_COOKIES_OUTPUT_SCHEMA,
       render(_args, value) {
         return [jsonBlock(value)]
       },
@@ -615,19 +573,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       height: { type: 'number', description: '视口高，默认 1200。' },
     },
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: true,
-        properties: {
-          ok: { type: 'boolean' },
-          url: { type: 'string' },
-          title: { type: 'string' },
-          readyState: { type: 'string' },
-          captured: { type: 'array' },
-          consoleErrors: { type: 'array' },
-          networkFailures: { type: 'array' },
-        },
-      },
+      schema: CHROME_PAGE_OUTPUT_SCHEMA,
       render(_args, value) {
         return [jsonBlock(value)]
       },
@@ -668,7 +614,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       sessionId: { type: 'string', description: '可选：直接指定已 attach 的 sessionId。' },
     },
     output: {
-      schema: { type: 'object', additionalProperties: true },
+      schema: CHROME_CDP_OUTPUT_SCHEMA,
       render(_args, value) {
         return [jsonBlock(value)]
       },

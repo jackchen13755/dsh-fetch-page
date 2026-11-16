@@ -260,6 +260,24 @@ Chrome 的远程调试授权是**每条 WebSocket 一次**，所以「断线就�
 
 `pausedReason` 取值：`failures`（网络/端点类连续失败）、`auth`（授权未获准）、`idle`（空闲断开）。
 
+#### 工具输出契约（`output.schema`）
+
+宿主的 `output.schema` 是**声明了就一定校验**的：字段声明成 `{type:'string'}` 而实参是 `null`
+时，调用会整体失败（`tool "chrome_hub" returned invalid output: "value.pausedReason" must be a string`），
+工具在正常状态下直接不可用。所以插件的契约定在 `browser-plugin/src/hub/tool-schemas.ts`：
+
+- **可空字段一律显式可空**：`oneOf: [{type:'string'}, {type:'null'}]`（宿主 DSL 原生支持，
+  TS/Py SDK 分别渲染成 `string | null` / `Union[str, None]`），不靠 `additionalProperties` 蒙混、
+  也不用 `''`/`-1` 之类哨兵值。
+- **形状恒定**：`hubStatusOutput()` 把 `HubStatus` 归一成固定字段集，不适用就是 `null`——
+  `ready` / `paused(auth)` / `paused(failures)` / 退避排期中 / `paused(idle)` / `connecting` /
+  无上游 七种状态字段集合完全一致，脚本不会踩到 `undefined`。
+- 覆盖的工具：`chrome_hub` `chrome_cookies` `chrome_page` `chrome_cdp` `browser` `verify_page`
+  （后两个是同一类缺陷：`verify_page` 没截图时 Python 报告给 `screenshot: null`）。
+- 契约测试在 `test/browser-plugin/lib/hub/tool-schemas.test.js`，用**宿主自己的校验器**
+  （`valueSchemaSpecToJsonSchema` + `assertSupportedJsonSchema` + `validateJsonSchemaValue`）
+  逐状态验证；真实状态来自真实 `CdpUpstream` + `composeHubStatus`。
+
 其余路由（`/cookies` `/targets` `/json/version` `/json/list` `/cdp` `/attach` `/events`）的路径与
 返回结构保持不变。
 

@@ -39,6 +39,8 @@ export interface HubStatus {
   connects: number
   disconnects: number
   requests: number
+  /** keepalive 探测单独计数（不污染 requests）。 */
+  keepalives: number
   errors: number
   lastError: string | null
   lastConnectedAt: string | null
@@ -66,6 +68,46 @@ export interface PageResult {
 }
 
 const DEFAULT_PORT = 9334
+
+/** 上游最小的状态面：抽成结构类型，纯函数可测、不依赖 CdpUpstream 具体类。 */
+export interface UpstreamStatusView {
+  isReady: boolean
+  endpoint: { wsUrl: string; source: string; profileDir?: string } | null
+  stats: {
+    connects: number
+    disconnects: number
+    requests: number
+    keepalives: number
+    errors: number
+    lastError: string | null
+    lastConnectedAt: string | null
+  }
+  health: {
+    paused: boolean
+    pausedReason: string | null
+    attempts: number
+    nextRetryMs: number | null
+  }
+}
+
+/**
+ * 状态组装**唯一实现**：`ChromeHub.status()` 与输出契约测试都走这里，
+ * 保证「测试里验的组装」就是「线上跑的组装」。
+ */
+export function composeHubStatus(base: HubStatus, upstream: UpstreamStatusView): HubStatus {
+  return {
+    ...base,
+    ready: upstream.isReady,
+    upstream: upstream.endpoint?.wsUrl ?? null,
+    source: upstream.endpoint?.source ?? null,
+    profileDir: upstream.endpoint?.profileDir ?? null,
+    ...upstream.stats,
+    paused: upstream.health.paused,
+    pausedReason: upstream.health.pausedReason,
+    attempts: upstream.health.attempts,
+    nextRetryMs: upstream.health.nextRetryMs,
+  }
+}
 
 async function probeHealth(baseUrl: string, timeoutMs = 1200): Promise<Record<string, unknown> | null> {
   try {
@@ -203,6 +245,7 @@ export class ChromeHub {
       connects: 0,
       disconnects: 0,
       requests: 0,
+      keepalives: 0,
       errors: 0,
       lastError: null,
       lastConnectedAt: null,
@@ -218,18 +261,7 @@ export class ChromeHub {
     }
     const upstream = this.upstream
     if (upstream === null) return base
-    return {
-      ...base,
-      ready: upstream.isReady,
-      upstream: upstream.endpoint?.wsUrl ?? null,
-      source: upstream.endpoint?.source ?? null,
-      profileDir: upstream.endpoint?.profileDir ?? null,
-      ...upstream.stats,
-      paused: upstream.health.paused,
-      pausedReason: upstream.health.pausedReason,
-      attempts: upstream.health.attempts,
-      nextRetryMs: upstream.health.nextRetryMs,
-    }
+    return composeHubStatus(base, upstream)
   }
 
   private statusFromExternal(health: Record<string, unknown>): HubStatus {
@@ -246,6 +278,7 @@ export class ChromeHub {
       connects: num(health.connects),
       disconnects: num(health.disconnects),
       requests: num(health.requests),
+      keepalives: num(health.keepalives),
       errors: num(health.errors),
       lastError: str(health.lastError),
       lastConnectedAt: str(health.lastConnectedAt),

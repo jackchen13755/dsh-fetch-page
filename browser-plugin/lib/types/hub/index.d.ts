@@ -23,6 +23,8 @@ export interface HubStatus {
     connects: number;
     disconnects: number;
     requests: number;
+    /** keepalive 探测单独计数（不污染 requests）。 */
+    keepalives: number;
     errors: number;
     lastError: string | null;
     lastConnectedAt: string | null;
@@ -52,6 +54,35 @@ export interface PageResult {
     networkFailures: string[];
     error?: string;
 }
+/** 上游最小的状态面：抽成结构类型，纯函数可测、不依赖 CdpUpstream 具体类。 */
+export interface UpstreamStatusView {
+    isReady: boolean;
+    endpoint: {
+        wsUrl: string;
+        source: string;
+        profileDir?: string;
+    } | null;
+    stats: {
+        connects: number;
+        disconnects: number;
+        requests: number;
+        keepalives: number;
+        errors: number;
+        lastError: string | null;
+        lastConnectedAt: string | null;
+    };
+    health: {
+        paused: boolean;
+        pausedReason: string | null;
+        attempts: number;
+        nextRetryMs: number | null;
+    };
+}
+/**
+ * 状态组装**唯一实现**：`ChromeHub.status()` 与输出契约测试都走这里，
+ * 保证「测试里验的组装」就是「线上跑的组装」。
+ */
+export declare function composeHubStatus(base: HubStatus, upstream: UpstreamStatusView): HubStatus;
 export declare class ChromeHub {
     private upstream;
     private server;

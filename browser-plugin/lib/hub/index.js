@@ -2,6 +2,24 @@ import { writeFile } from 'node:fs/promises';
 import { CdpUpstream } from './upstream.js';
 import { createHubServer, summarizeCookies } from './server.js';
 const DEFAULT_PORT = 9334;
+/**
+ * 状态组装**唯一实现**：`ChromeHub.status()` 与输出契约测试都走这里，
+ * 保证「测试里验的组装」就是「线上跑的组装」。
+ */
+export function composeHubStatus(base, upstream) {
+    return {
+        ...base,
+        ready: upstream.isReady,
+        upstream: upstream.endpoint?.wsUrl ?? null,
+        source: upstream.endpoint?.source ?? null,
+        profileDir: upstream.endpoint?.profileDir ?? null,
+        ...upstream.stats,
+        paused: upstream.health.paused,
+        pausedReason: upstream.health.pausedReason,
+        attempts: upstream.health.attempts,
+        nextRetryMs: upstream.health.nextRetryMs,
+    };
+}
 async function probeHealth(baseUrl, timeoutMs = 1200) {
     try {
         const ac = new AbortController();
@@ -130,6 +148,7 @@ export class ChromeHub {
             connects: 0,
             disconnects: 0,
             requests: 0,
+            keepalives: 0,
             errors: 0,
             lastError: null,
             lastConnectedAt: null,
@@ -146,18 +165,7 @@ export class ChromeHub {
         const upstream = this.upstream;
         if (upstream === null)
             return base;
-        return {
-            ...base,
-            ready: upstream.isReady,
-            upstream: upstream.endpoint?.wsUrl ?? null,
-            source: upstream.endpoint?.source ?? null,
-            profileDir: upstream.endpoint?.profileDir ?? null,
-            ...upstream.stats,
-            paused: upstream.health.paused,
-            pausedReason: upstream.health.pausedReason,
-            attempts: upstream.health.attempts,
-            nextRetryMs: upstream.health.nextRetryMs,
-        };
+        return composeHubStatus(base, upstream);
     }
     statusFromExternal(health) {
         const num = (v) => (typeof v === 'number' ? v : 0);
@@ -173,6 +181,7 @@ export class ChromeHub {
             connects: num(health.connects),
             disconnects: num(health.disconnects),
             requests: num(health.requests),
+            keepalives: num(health.keepalives),
             errors: num(health.errors),
             lastError: str(health.lastError),
             lastConnectedAt: str(health.lastConnectedAt),
